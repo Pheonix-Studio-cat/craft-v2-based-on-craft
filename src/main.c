@@ -3019,6 +3019,12 @@ int main(int argc, char **argv) {
             // FLUSH DATABASE //
             if (now - last_commit > COMMIT_INTERVAL) {
                 last_commit = now;
+#ifdef __EMSCRIPTEN__
+                // A browser tab is never shut down properly, so the position
+                // has to be written with every commit -- not only in the
+                // shutdown path below, which the web build never reaches.
+                db_save_state(s->x, s->y, s->z, s->rx, s->ry);
+#endif
                 db_commit();
 #ifdef __EMSCRIPTEN__
                 web_save_world();
