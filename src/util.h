@@ -1,7 +1,11 @@
 #ifndef _util_h_
 #define _util_h_
 
+#ifdef __EMSCRIPTEN__
+#include <GLES2/gl2.h>
+#else
 #include <GL/glew.h>
+#endif
 #include <GLFW/glfw3.h>
 #include "config.h"
 

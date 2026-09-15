@@ -6,6 +6,23 @@ http://www.michaelfogleman.com/craft/
 
 ![Screenshot](https://i.imgur.com/SH7wcas.png)
 
+### Play in a browser
+
+A WebAssembly build with touch controls is published from this repository:
+
+**https://pheonix-studio-cat.github.io/craft-v2-based-on-craft/**
+
+Walk with the stick, look around by dragging, break and place blocks with the
+buttons. A keyboard works as well. The world is kept in the browser's storage
+and survives a reload. Single player only -- the online mode needs raw sockets,
+which a browser does not have.
+
+To build it yourself, with the Emscripten SDK installed:
+
+    ./web/build.sh      # writes build/web/
+
+`web/README.md` explains what the browser build changes and why.
+
 ### Features
 
 * Simple but nice looking terrain generation using perlin / simplex noise.

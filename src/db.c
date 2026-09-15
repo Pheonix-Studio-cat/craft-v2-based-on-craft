@@ -20,6 +20,9 @@ static sqlite3_stmt *set_key_stmt;
 
 static Ring ring;
 static thrd_t thrd;
+#ifdef __EMSCRIPTEN__
+static void db_drain();
+#endif
 static mtx_t mtx;
 static cnd_t cnd;
 static mtx_t load_mtx;
@@ -177,6 +180,9 @@ void db_commit() {
     ring_put_commit(&ring);
     cnd_signal(&cnd);
     mtx_unlock(&mtx);
+#ifdef __EMSCRIPTEN__
+    db_drain();
+#endif
 }
 
 void _db_commit() {
@@ -494,7 +500,9 @@ void db_worker_start(char *path) {
     mtx_init(&mtx, mtx_plain);
     mtx_init(&load_mtx, mtx_plain);
     cnd_init(&cnd);
+#ifndef __EMSCRIPTEN__
     thrd_create(&thrd, db_worker_run, path);
+#endif
 }
 
 void db_worker_stop() {
@@ -505,12 +513,43 @@ void db_worker_stop() {
     ring_put_exit(&ring);
     cnd_signal(&cnd);
     mtx_unlock(&mtx);
+#ifdef __EMSCRIPTEN__
+    db_drain();
+#else
     thrd_join(thrd, NULL);
+#endif
     cnd_destroy(&cnd);
     mtx_destroy(&load_mtx);
     mtx_destroy(&mtx);
     ring_free(&ring);
 }
+
+#ifdef __EMSCRIPTEN__
+// The browser build has no worker thread. The queue is emptied here, on the
+// main thread, whenever a commit is due -- which is every COMMIT_INTERVAL
+// seconds and once more when the database is closed.
+static void db_drain() {
+    RingEntry e;
+    while (ring_get(&ring, &e)) {
+        switch (e.type) {
+            case BLOCK:
+                _db_insert_block(e.p, e.q, e.x, e.y, e.z, e.w);
+                break;
+            case LIGHT:
+                _db_insert_light(e.p, e.q, e.x, e.y, e.z, e.w);
+                break;
+            case KEY:
+                _db_set_key(e.p, e.q, e.key);
+                break;
+            case COMMIT:
+                _db_commit();
+                break;
+            case EXIT:
+                break;
+        }
+    }
+}
+#endif
 
 int db_worker_run(void *arg) {
     int running = 1;

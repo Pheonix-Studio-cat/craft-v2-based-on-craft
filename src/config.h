@@ -44,10 +44,19 @@
 #define CRAFT_KEY_SIGN '`'
 
 // advanced parameters
+#ifdef __EMSCRIPTEN__
+// A phone draws and generates far less than a desktop: a smaller world around
+// the player keeps the frame rate usable.
+#define CREATE_CHUNK_RADIUS 5
+#define RENDER_CHUNK_RADIUS 5
+#define RENDER_SIGN_RADIUS 3
+#define DELETE_CHUNK_RADIUS 8
+#else
 #define CREATE_CHUNK_RADIUS 10
 #define RENDER_CHUNK_RADIUS 10
 #define RENDER_SIGN_RADIUS 4
 #define DELETE_CHUNK_RADIUS 14
+#endif
 #define CHUNK_SIZE 32
 #define COMMIT_INTERVAL 5
 

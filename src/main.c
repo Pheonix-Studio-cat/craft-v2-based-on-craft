@@ -1,6 +1,13 @@
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#include <emscripten/html5.h>
+#include <GLES2/gl2.h>
+#include <unistd.h>
+#else
 #include <GL/glew.h>
-#include <GLFW/glfw3.h>
 #include <curl/curl.h>
+#endif
+#include <GLFW/glfw3.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,7 +29,13 @@
 
 #define MAX_CHUNKS 8192
 #define MAX_PLAYERS 128
+#ifdef __EMSCRIPTEN__
+// The browser build has no threads (see web/README.md): the worker runs on
+// the main thread, one chunk per frame.
+#define WORKERS 1
+#else
 #define WORKERS 4
+#endif
 #define MAX_TEXT_LENGTH 256
 #define MAX_NAME_LENGTH 32
 #define MAX_PATH_LENGTH 256
@@ -184,6 +197,15 @@ float get_daylight() {
 }
 
 int get_scale_factor() {
+#ifdef __EMSCRIPTEN__
+    // The canvas is sized in device pixels, so window and framebuffer are the
+    // same size and the ratio below would always be 1 -- which would leave the
+    // crosshair, the text and the held item at half size on a phone.
+    double ratio = EM_ASM_DOUBLE({
+        return Math.min(window.devicePixelRatio || 1, 2);
+    });
+    return ratio >= 1.5 ? 2 : 1;
+#else
     int window_width, window_height;
     int buffer_width, buffer_height;
     glfwGetWindowSize(g->window, &window_width, &window_height);
@@ -192,6 +214,7 @@ int get_scale_factor() {
     result = MAX(1, result);
     result = MIN(2, result);
     return result;
+#endif
 }
 
 void get_sight_vector(float rx, float ry, float *vx, float *vy, float *vz) {
@@ -1425,6 +1448,17 @@ void ensure_chunks(Player *player) {
             ensure_chunks_worker(player, worker);
         }
         mtx_unlock(&worker->mtx);
+#ifdef __EMSCRIPTEN__
+        // No worker thread in the browser: do the one job here and now.
+        if (worker->state == WORKER_BUSY) {
+            WorkerItem *item = &worker->item;
+            if (item->load) {
+                load_chunk(item);
+            }
+            compute_chunk(item);
+            worker->state = WORKER_DONE;
+        }
+#endif
     }
 }
 
@@ -1742,12 +1776,16 @@ void render_wireframe(Attrib *attrib, Player *player) {
     if (is_obstacle(hw)) {
         glUseProgram(attrib->program);
         glLineWidth(1);
+#ifndef __EMSCRIPTEN__
         glEnable(GL_COLOR_LOGIC_OP);
+#endif
         glUniformMatrix4fv(attrib->matrix, 1, GL_FALSE, matrix);
         GLuint wireframe_buffer = gen_wireframe_buffer(hx, hy, hz, 0.53);
         draw_lines(attrib, wireframe_buffer, 3, 24);
         del_buffer(wireframe_buffer);
+#ifndef __EMSCRIPTEN__
         glDisable(GL_COLOR_LOGIC_OP);
+#endif
     }
 }
 
@@ -1756,12 +1794,16 @@ void render_crosshairs(Attrib *attrib) {
     set_matrix_2d(matrix, g->width, g->height);
     glUseProgram(attrib->program);
     glLineWidth(4 * g->scale);
+#ifndef __EMSCRIPTEN__
     glEnable(GL_COLOR_LOGIC_OP);
+#endif
     glUniformMatrix4fv(attrib->matrix, 1, GL_FALSE, matrix);
     GLuint crosshair_buffer = gen_crosshair_buffer();
     draw_lines(attrib, crosshair_buffer, 2, 4);
     del_buffer(crosshair_buffer);
+#ifndef __EMSCRIPTEN__
     glDisable(GL_COLOR_LOGIC_OP);
+#endif
 }
 
 void render_item(Attrib *attrib) {
@@ -2339,9 +2381,14 @@ void on_mouse_button(GLFWwindow *window, int button, int action, int mods) {
                 on_left_click();
             }
         }
+#ifndef __EMSCRIPTEN__
         else {
+            // In the browser this asks for pointer lock, which freezes the
+            // cursor position the look handler reads -- and a touch screen
+            // has no cursor to lock in the first place.
             glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
         }
+#endif
     }
     if (button == GLFW_MOUSE_BUTTON_RIGHT) {
         if (exclusive) {
@@ -2360,10 +2407,111 @@ void on_mouse_button(GLFWwindow *window, int button, int action, int mods) {
     }
 }
 
+#ifdef __EMSCRIPTEN__
+
+// ---------------------------------------------------------------------------
+// Browser build: on-screen controls
+//
+// web/shell.html calls the functions below. They only collect state; it is
+// applied in handle_mouse_input() and handle_movement(), in the same place
+// where the desktop build reads mouse and keyboard.
+// ---------------------------------------------------------------------------
+
+typedef struct {
+    float move_x;      // strafe, -1 (left) .. 1 (right)
+    float move_z;      // walk, -1 (forward) .. 1 (backward)
+    float move_scale;  // 0 .. 1, how far the stick is pushed
+    float look_dx;     // look delta in pixels, consumed once per frame
+    float look_dy;
+    int jump;          // 1 while the jump button is held down
+} TouchInput;
+
+static TouchInput touch;
+
+EMSCRIPTEN_KEEPALIVE void craft_touch_move(float x, float z, float scale) {
+    touch.move_x = x;
+    touch.move_z = z;
+    touch.move_scale = scale;
+}
+
+EMSCRIPTEN_KEEPALIVE void craft_touch_look(float dx, float dy) {
+    touch.look_dx += dx;
+    touch.look_dy += dy;
+}
+
+EMSCRIPTEN_KEEPALIVE void craft_touch_jump(int down) {
+    touch.jump = down;
+}
+
+EMSCRIPTEN_KEEPALIVE void craft_toggle_fly() {
+    g->flying = !g->flying;
+}
+
+EMSCRIPTEN_KEEPALIVE int craft_is_flying() {
+    return g->flying;
+}
+
+EMSCRIPTEN_KEEPALIVE void craft_break_block() {
+    on_left_click();
+}
+
+EMSCRIPTEN_KEEPALIVE void craft_place_block() {
+    on_right_click();
+}
+
+EMSCRIPTEN_KEEPALIVE void craft_pick_block() {
+    on_middle_click();
+}
+
+EMSCRIPTEN_KEEPALIVE void craft_cycle_item(int direction) {
+    g->item_index = (g->item_index + direction) % item_count;
+    if (g->item_index < 0) {
+        g->item_index += item_count;
+    }
+}
+
+EMSCRIPTEN_KEEPALIVE void craft_resize(int width, int height) {
+    emscripten_set_canvas_element_size("#canvas", width, height);
+}
+
+// Hand the finished frame to the browser and continue on the next animation
+// frame. This replaces the blocking buffer swap of the desktop build;
+// -sASYNCIFY lets the main loop wait here without being restructured.
+EM_ASYNC_JS(void, web_wait_for_frame, (), {
+    await new Promise(function(resolve) { requestAnimationFrame(resolve); });
+});
+
+// Copy the sqlite file from the in-memory file system into IndexedDB, so the
+// world survives a reload. Never runs twice at the same time.
+EM_JS(void, web_save_world, (), {
+    if (Module.worldSyncPending) {
+        return;
+    }
+    Module.worldSyncPending = 1;
+    FS.syncfs(false, function(error) {
+        Module.worldSyncPending = 0;
+        if (error) {
+            console.error('saving the world failed:', error);
+        }
+    });
+});
+
+#endif
+
 void create_window() {
     int window_width = WINDOW_WIDTH;
     int window_height = WINDOW_HEIGHT;
     GLFWmonitor *monitor = NULL;
+#ifdef __EMSCRIPTEN__
+    // Fill the browser window. The device pixel ratio is capped at 2 -- a
+    // phone with ratio 3 would render three times the pixels it can show.
+    window_width = EM_ASM_INT({
+        return Math.round(window.innerWidth * Math.min(window.devicePixelRatio || 1, 2));
+    });
+    window_height = EM_ASM_INT({
+        return Math.round(window.innerHeight * Math.min(window.devicePixelRatio || 1, 2));
+    });
+#endif
     if (FULLSCREEN) {
         int mode_count;
         monitor = glfwGetPrimaryMonitor();
@@ -2376,6 +2524,30 @@ void create_window() {
 }
 
 void handle_mouse_input() {
+#ifdef __EMSCRIPTEN__
+    // The browser has no pointer lock on iOS: the look comes from dragging
+    // across the canvas, collected by craft_touch_look().
+    State *s = &g->players->state;
+    float m = 0.0025;
+    s->rx += touch.look_dx * m;
+    if (INVERT_MOUSE) {
+        s->ry += touch.look_dy * m;
+    }
+    else {
+        s->ry -= touch.look_dy * m;
+    }
+    touch.look_dx = 0;
+    touch.look_dy = 0;
+    if (s->rx < 0) {
+        s->rx += RADIANS(360);
+    }
+    if (s->rx >= RADIANS(360)) {
+        s->rx -= RADIANS(360);
+    }
+    s->ry = MAX(s->ry, -RADIANS(90));
+    s->ry = MIN(s->ry, RADIANS(90));
+    return;
+#else
     int exclusive =
         glfwGetInputMode(g->window, GLFW_CURSOR) == GLFW_CURSOR_DISABLED;
     static double px = 0;
@@ -2406,6 +2578,7 @@ void handle_mouse_input() {
     else {
         glfwGetCursorPos(g->window, &px, &py);
     }
+#endif
 }
 
 void handle_movement(double dt) {
@@ -2425,11 +2598,21 @@ void handle_movement(double dt) {
         if (glfwGetKey(g->window, GLFW_KEY_RIGHT)) s->rx += m;
         if (glfwGetKey(g->window, GLFW_KEY_UP)) s->ry += m;
         if (glfwGetKey(g->window, GLFW_KEY_DOWN)) s->ry -= m;
+#ifdef __EMSCRIPTEN__
+        if (touch.move_z < -0.3) sz--;
+        if (touch.move_z > 0.3) sz++;
+        if (touch.move_x < -0.3) sx--;
+        if (touch.move_x > 0.3) sx++;
+#endif
     }
     float vx, vy, vz;
     get_motion_vector(g->flying, sz, sx, s->rx, s->ry, &vx, &vy, &vz);
     if (!g->typing) {
-        if (glfwGetKey(g->window, CRAFT_KEY_JUMP)) {
+        int jump = glfwGetKey(g->window, CRAFT_KEY_JUMP);
+#ifdef __EMSCRIPTEN__
+        jump = jump || touch.jump;
+#endif
+        if (jump) {
             if (g->flying) {
                 vy = 1;
             }
@@ -2439,6 +2622,12 @@ void handle_movement(double dt) {
         }
     }
     float speed = g->flying ? 20 : 5;
+#ifdef __EMSCRIPTEN__
+    // A stick pushed halfway walks at half speed.
+    if ((sx || sz) && touch.move_scale > 0) {
+        speed *= MAX(0.35, MIN(1.0, touch.move_scale));
+    }
+#endif
     int estimate = roundf(sqrtf(
         powf(vx * speed, 2) +
         powf(vy * speed + ABS(dy) * 2, 2) +
@@ -2585,7 +2774,9 @@ void reset_model() {
 
 int main(int argc, char **argv) {
     // INITIALIZATION //
+#ifndef __EMSCRIPTEN__
     curl_global_init(CURL_GLOBAL_DEFAULT);
+#endif
     srand(time(NULL));
     rand();
 
@@ -2601,19 +2792,27 @@ int main(int argc, char **argv) {
 
     glfwMakeContextCurrent(g->window);
     glfwSwapInterval(VSYNC);
+#ifndef __EMSCRIPTEN__
+    // No pointer lock in the browser build -- a touch screen has no cursor
+    // to capture, and asking for the lock breaks the touch controls.
     glfwSetInputMode(g->window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+#endif
     glfwSetKeyCallback(g->window, on_key);
     glfwSetCharCallback(g->window, on_char);
     glfwSetMouseButtonCallback(g->window, on_mouse_button);
     glfwSetScrollCallback(g->window, on_scroll);
 
+#ifndef __EMSCRIPTEN__
     if (glewInit() != GLEW_OK) {
         return -1;
     }
+#endif
 
     glEnable(GL_CULL_FACE);
     glEnable(GL_DEPTH_TEST);
+#ifndef __EMSCRIPTEN__
     glLogicOp(GL_INVERT);
+#endif
     glClearColor(0, 0, 0, 1);
 
     // LOAD TEXTURES //
@@ -2723,8 +2922,19 @@ int main(int argc, char **argv) {
         worker->state = WORKER_IDLE;
         mtx_init(&worker->mtx, mtx_plain);
         cnd_init(&worker->cnd);
+#ifndef __EMSCRIPTEN__
         thrd_create(&worker->thrd, worker_run, worker);
+#endif
     }
+
+#ifdef __EMSCRIPTEN__
+    // Textures and shaders are loaded; from here on every file belongs to the
+    // world. /craft is backed by IndexedDB (see web/pre.js), so craft.db and
+    // auth.db survive closing the tab.
+    if (chdir("/craft")) {
+        fprintf(stderr, "chdir /craft failed\n");
+    }
+#endif
 
     // OUTER LOOP //
     int running = 1;
@@ -2810,6 +3020,9 @@ int main(int argc, char **argv) {
             if (now - last_commit > COMMIT_INTERVAL) {
                 last_commit = now;
                 db_commit();
+#ifdef __EMSCRIPTEN__
+                web_save_world();
+#endif
             }
 
             // SEND POSITION TO SERVER //
@@ -2936,6 +3149,9 @@ int main(int argc, char **argv) {
             // SWAP AND POLL //
             glfwSwapBuffers(g->window);
             glfwPollEvents();
+#ifdef __EMSCRIPTEN__
+            web_wait_for_frame();
+#endif
             if (glfwWindowShouldClose(g->window)) {
                 running = 0;
                 break;
@@ -2949,6 +3165,9 @@ int main(int argc, char **argv) {
         // SHUTDOWN //
         db_save_state(s->x, s->y, s->z, s->rx, s->ry);
         db_close();
+#ifdef __EMSCRIPTEN__
+        web_save_world();
+#endif
         db_disable();
         client_stop();
         client_disable();
@@ -2958,6 +3177,8 @@ int main(int argc, char **argv) {
     }
 
     glfwTerminate();
+#ifndef __EMSCRIPTEN__
     curl_global_cleanup();
+#endif
     return 0;
 }
