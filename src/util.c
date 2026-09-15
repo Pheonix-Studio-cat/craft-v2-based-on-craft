@@ -1,6 +1,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <errno.h>
 #include "lodepng.h"
 #include "matrix.h"
@@ -83,9 +84,28 @@ GLuint make_shader(GLenum type, const char *source) {
     return shader;
 }
 
+// The shader files carry no #version line of their own: the desktop build
+// needs GLSL 1.20, WebGL needs GLSL ES 1.00 plus a default precision. Both
+// prologues are prepended here so that one set of shaders serves both.
 GLuint load_shader(GLenum type, const char *path) {
     char *data = load_file(path);
-    GLuint result = make_shader(type, data);
+#ifdef __EMSCRIPTEN__
+    // A fragment shader has no default float precision, and its default int
+    // precision is mediump -- but a vertex shader's is highp. A uniform used
+    // by both (ortho) must have the same precision in both, or the program
+    // does not link. Declaring highp for both in the fragment shader matches
+    // the vertex shader's defaults.
+    const char *header = type == GL_FRAGMENT_SHADER
+        ? "#version 100\nprecision highp float;\nprecision highp int;\n"
+        : "#version 100\n";
+#else
+    const char *header = "#version 120\n";
+#endif
+    char *source = malloc(strlen(header) + strlen(data) + 1);
+    strcpy(source, header);
+    strcat(source, data);
+    GLuint result = make_shader(type, source);
+    free(source);
     free(data);
     return result;
 }

@@ -1,0 +1,52 @@
+# Builds the browser version and publishes it to GitHub Pages.
+#
+# Every push is built, so a branch shows red before it is merged. Only master
+# is deployed. In the repository settings, Pages > Source must be set to
+# "GitHub Actions".
+name: web
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the Emscripten SDK
+        run: |
+          git clone --depth 1 https://github.com/emscripten-core/emsdk.git
+          cd emsdk
+          ./emsdk install 4.0.7
+          ./emsdk activate 4.0.7
+
+      - name: Build
+        run: |
+          source emsdk/emsdk_env.sh
+          ./web/build.sh
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: build/web
+
+  deploy:
+    needs: build
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

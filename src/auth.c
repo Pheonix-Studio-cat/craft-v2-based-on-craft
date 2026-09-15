@@ -1,4 +1,6 @@
+#ifndef __EMSCRIPTEN__
 #include <curl/curl.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -6,6 +8,17 @@
 
 #define MAX_POST_LENGTH 1024
 #define MAX_RESPONSE_LENGTH 1024
+
+#ifdef __EMSCRIPTEN__
+
+// The browser build is offline only: no curl, and no online mode to log in to.
+int get_access_token(
+    char *result, int length, char *username, char *identity_token)
+{
+    return 0;
+}
+
+#else
 
 size_t write_function(char *data, size_t size, size_t count, void *arg) {
     size_t length = size * count;
@@ -47,3 +60,5 @@ int get_access_token(
     }
     return 0;
 }
+
+#endif
