@@ -21,6 +21,8 @@
 #define MOB_MAGMA_BRUTE 8
 #define MOB_WRAITH 9
 #define MOB_KIND_COUNT 10
+// room for creatures an add-on brings along
+#define MAX_MOB_TYPES 24
 
 typedef struct {
     char name[24];
@@ -66,6 +68,9 @@ void entities_init();
 void entities_clear();
 int entities_tick_count();
 MobType *mob_type(int kind);
+int mob_type_count();
+int entity_register_type(const char *name, int tile, int health, float speed,
+    int damage, int hostile, int drop, int drop_count);
 Entity *entity_at(int index);
 int entity_count();
 Projectile *projectile_at(int index);

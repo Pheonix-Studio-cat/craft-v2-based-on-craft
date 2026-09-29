@@ -17,6 +17,7 @@
 #include "client.h"
 #include "config.h"
 #include "cube.h"
+#include "addon.h"
 #include "db.h"
 #include "entity.h"
 #include "inventory.h"
@@ -1666,6 +1667,16 @@ void record_block(int x, int y, int z, int w) {
     g->block0.w = w;
 }
 
+// The OpenGL half of src/addon.c: a generated tile goes straight into the
+// atlas that is already on the graphics card.
+void addon_upload_tile(int tile, const unsigned char *pixels) {
+    glActiveTexture(GL_TEXTURE0);
+    // the atlas was flipped when it was loaded, so tile row 0 is row 0 here
+    glTexSubImage2D(GL_TEXTURE_2D, 0,
+        (tile % 16) * 16, (tile / 16) * 16, 16, 16,
+        GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+}
+
 // What entity.c asks the world.
 int entity_block_at(int x, int y, int z);
 
@@ -3127,6 +3138,48 @@ EMSCRIPTEN_KEEPALIVE void craft_teleport(float x, float y, float z) {
     g->dy = 0;
 }
 
+// --- add-ons (see web/ADDONS.md) ------------------------------------------
+//
+// The browser parses the JSON and calls these. An add-on is data: there is
+// no call here that runs anything it supplies.
+
+EMSCRIPTEN_KEEPALIVE int craft_addon_block(
+    const char *name, int red, int green, int blue, int speckle, int glassy)
+{
+    return addon_add_block(name, red, green, blue, speckle, glassy);
+}
+
+EMSCRIPTEN_KEEPALIVE int craft_addon_item(
+    const char *name, int kind, int red, int green, int blue,
+    int damage, int heal)
+{
+    return addon_add_item(name, kind, red, green, blue, damage, heal);
+}
+
+EMSCRIPTEN_KEEPALIVE int craft_addon_recipe(
+    int result, int count, int item0, int count0, int item1, int count1)
+{
+    return addon_add_recipe(result, count, item0, count0, item1, count1);
+}
+
+EMSCRIPTEN_KEEPALIVE int craft_addon_creature(
+    const char *name, int red, int green, int blue, int health, int speed,
+    int damage, int hostile, int drop, int drop_count)
+{
+    return addon_add_creature(name, red, green, blue, health, speed, damage,
+        hostile, drop, drop_count);
+}
+
+// Everything an add-on added disappears again; the interface reloads the
+// page afterwards, so the tables are rebuilt from scratch.
+EMSCRIPTEN_KEEPALIVE void craft_addon_reset() {
+    addon_reset();
+}
+
+EMSCRIPTEN_KEEPALIVE int craft_addon_count() {
+    return addon_block_count() + addon_item_count();
+}
+
 EMSCRIPTEN_KEEPALIVE int craft_dimension() {
     return g->dimension;
 }
@@ -3564,6 +3617,7 @@ int main(int argc, char **argv) {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     load_png_texture("textures/texture.png");
+    addon_set_atlas(texture);
 
     GLuint font;
     glGenTextures(1, &font);

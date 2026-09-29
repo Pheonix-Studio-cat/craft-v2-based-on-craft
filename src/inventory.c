@@ -4,6 +4,13 @@
 #include "inventory.h"
 #include "item.h"
 
+static void add_type(
+    int id, const char *name, int kind, int block, int tile,
+    int stack, int damage, int heal, float cooldown);
+static void add_recipe(
+    int result, int result_count,
+    int item0, int count0, int item1, int count1, int item2, int count2);
+
 static ItemType types[MAX_ITEM_TYPES];
 static Slot inventory[INVENTORY_SIZE];
 static Recipe recipes[MAX_RECIPES];
@@ -13,6 +20,25 @@ static int version = 1;
 // ---------------------------------------------------------------------------
 // the registry
 // ---------------------------------------------------------------------------
+
+// What an add-on registers goes through the same door the built-in items
+// use -- there is only one table.
+void inventory_register(
+    int id, const char *name, int kind, int block, int tile,
+    int stack, int damage, int heal, float cooldown)
+{
+    add_type(id, name, kind, block, tile, stack, damage, heal, cooldown);
+}
+
+int inventory_register_recipe(int result, int count,
+    int item0, int count0, int item1, int count1)
+{
+    if (recipes_used >= MAX_RECIPES) {
+        return 0;
+    }
+    add_recipe(result, count, item0, count0, item1, count1, 0, 0);
+    return 1;
+}
 
 static void add_type(
     int id, const char *name, int kind, int block, int tile,

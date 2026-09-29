@@ -42,6 +42,8 @@ emcc \
     -o build/web/index.html
 
 cp web/ui.js web/ui.css build/web/
+mkdir -p build/web/addons
+cp web/addons/*.json build/web/addons/
 cp textures/texture.png build/web/texture.png
 
 echo "built build/web/index.html"

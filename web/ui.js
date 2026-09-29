@@ -28,6 +28,8 @@ var CraftUI = (function () {
     var currentTab = 'bag';
     var modalKind = null;
     var sensitivity = 2.2;
+    var addons = [];          // [{name, enabled, data}]
+    var addonColors = {};     // item id -> colour, for the icons
 
     // ----------------------------------------------------------------- glue
     function call(name) {
@@ -82,7 +84,8 @@ var CraftUI = (function () {
 
     function paintSlot(node, item, count) {
         var type = items[item];
-        node.style.backgroundImage = type ? icon(type.tile) : '';
+        node.style.backgroundImage = addonColors[item] ? '' : (type ? icon(type.tile) : '');
+        node.style.backgroundColor = addonColors[item] || '';
         node.innerHTML = '';
         if (count > 1) {
             node.appendChild(el('span', 'count', String(count)));
@@ -142,6 +145,239 @@ var CraftUI = (function () {
         }
     }
 
+    // -------------------------------------------------------------- add-ons
+    // An add-on is data: a list of blocks, items, creatures and recipes.
+    // Nothing in the file is ever executed -- the fields below are the only
+    // ones that are read, everything else is ignored.
+    var LIMITS = { blocks: 40, items: 40, creatures: 12, recipes: 30 };
+
+    function loadAddons() {
+        try {
+            addons = JSON.parse(localStorage.getItem('craft.addons') || '[]');
+        } catch (e) {
+            addons = [];
+        }
+    }
+
+    function saveAddons() {
+        try {
+            localStorage.setItem('craft.addons', JSON.stringify(addons));
+        } catch (e) {}
+    }
+
+    function colourOf(value) {
+        if (Array.isArray(value)) {
+            return [value[0] | 0, value[1] | 0, value[2] | 0];
+        }
+        var text = String(value || '#888888').replace('#', '');
+        if (text.length === 3) {
+            text = text[0] + text[0] + text[1] + text[1] + text[2] + text[2];
+        }
+        return [parseInt(text.slice(0, 2), 16) || 0,
+                parseInt(text.slice(2, 4), 16) || 0,
+                parseInt(text.slice(4, 6), 16) || 0];
+    }
+
+    function hex(rgb) {
+        return '#' + rgb.map(function (v) {
+            return ('0' + Math.max(0, Math.min(255, v)).toString(16)).slice(-2);
+        }).join('');
+    }
+
+    function describe(data) {
+        var parts = [];
+        ['blocks', 'items', 'creatures', 'recipes'].forEach(function (key) {
+            var list = data && data[key];
+            if (list && list.length) parts.push(list.length + ' ' + key);
+        });
+        return parts.join(', ') || 'nothing at all';
+    }
+
+    // Reads an add-on and hands its definitions to the game. Returns the
+    // names it registered, so recipes can point at them.
+    function applyAddon(data) {
+        var names = {};
+        function id(value) {
+            if (typeof value === 'number') return value;
+            if (names[value] !== undefined) return names[value];
+            var found = 0;
+            Object.keys(items).forEach(function (key) {
+                if (items[key].name.toLowerCase() === String(value).toLowerCase()) {
+                    found = items[key].id;
+                }
+            });
+            return found;
+        }
+        (data.blocks || []).slice(0, LIMITS.blocks).forEach(function (block) {
+            var rgb = colourOf(block.colour || block.color);
+            var newId = Module.ccall('craft_addon_block', 'number',
+                ['string', 'number', 'number', 'number', 'number', 'number'],
+                [String(block.name || 'Block').slice(0, 22),
+                 rgb[0], rgb[1], rgb[2], block.speckle | 0,
+                 block.seeThrough ? 1 : 0]);
+            if (newId) {
+                names[block.name] = newId;
+                addonColors[newId] = hex(rgb);
+            }
+        });
+        (data.items || []).slice(0, LIMITS.items).forEach(function (item) {
+            var rgb = colourOf(item.colour || item.color);
+            var kinds = { material: 4, weapon: 2, crossbow: 3, food: 5, tool: 1 };
+            var newId = Module.ccall('craft_addon_item', 'number',
+                ['string', 'number', 'number', 'number', 'number', 'number', 'number'],
+                [String(item.name || 'Item').slice(0, 22),
+                 kinds[item.kind] === undefined ? 4 : kinds[item.kind],
+                 rgb[0], rgb[1], rgb[2], item.damage | 0, item.heal | 0]);
+            if (newId) {
+                names[item.name] = newId;
+                addonColors[newId] = hex(rgb);
+            }
+        });
+        (data.creatures || []).slice(0, LIMITS.creatures).forEach(function (mob) {
+            var rgb = colourOf(mob.colour || mob.color);
+            Module.ccall('craft_addon_creature', 'number',
+                ['string', 'number', 'number', 'number', 'number', 'number',
+                 'number', 'number', 'number', 'number'],
+                [String(mob.name || 'Creature').slice(0, 22),
+                 rgb[0], rgb[1], rgb[2],
+                 mob.health || 10, Math.round((mob.speed || 2.5) * 10),
+                 mob.damage || 0, mob.hostile ? 1 : 0,
+                 id(mob.drops || 0), mob.dropCount || 1]);
+        });
+        (data.recipes || []).slice(0, LIMITS.recipes).forEach(function (recipe) {
+            var need = recipe.needs || [];
+            call('craft_addon_recipe', id(recipe.makes), recipe.count || 1,
+                id(need[0] && need[0][0]), (need[0] && need[0][1]) || 1,
+                id(need[1] && need[1][0]), (need[1] && need[1][1]) || 0);
+        });
+    }
+
+    function applyAddons() {
+        call('craft_addon_reset');
+        addonColors = {};
+        addons.forEach(function (addon) {
+            if (addon.enabled === false) return;
+            try {
+                applyAddon(addon.data);
+            } catch (e) {
+                console.error('add-on "' + addon.name + '" could not be read:', e);
+            }
+        });
+    }
+
+    function addAddon(text, source) {
+        var data;
+        try {
+            data = JSON.parse(text);
+        } catch (e) {
+            return 'That is not valid JSON.';
+        }
+        if (!data || typeof data !== 'object' ||
+            !(data.blocks || data.items || data.creatures || data.recipes))
+        {
+            return 'An add-on needs at least one of blocks, items, creatures or recipes.';
+        }
+        addons.push({
+            name: String(data.name || source || 'Add-on').slice(0, 40),
+            author: String(data.author || '').slice(0, 40),
+            enabled: true,
+            data: data
+        });
+        saveAddons();
+        return null;
+    }
+
+    function renderMarket() {
+        panel.appendChild(el('h1', null, 'Marketplace'));
+        panel.appendChild(el('p', null,
+            'Add-ons are data, not programs: a list of blocks, items, ' +
+            'creatures and recipes. Nothing in such a file can run, reach ' +
+            'this world or talk to anyone.'));
+
+        if (!addons.length) {
+            panel.appendChild(el('p', null, 'Nothing installed yet.'));
+        }
+        addons.forEach(function (addon, index) {
+            var row = el('button', 'recipe');
+            var dot = el('div', 'icon');
+            dot.style.background = addon.enabled === false ? '#555' : '#7fc97f';
+            dot.style.borderRadius = '50%';
+            row.appendChild(dot);
+            var name = el('div', 'name');
+            name.appendChild(document.createTextNode(addon.name));
+            name.appendChild(el('div', 'need',
+                describe(addon.data) + (addon.author ? ' · by ' + addon.author : '')));
+            row.appendChild(name);
+            row.appendChild(el('div', 'need',
+                addon.enabled === false ? 'off' : 'on'));
+            row.addEventListener('click', function () {
+                addon.enabled = addon.enabled === false;
+                saveAddons();
+                renderModal();
+            });
+            panel.appendChild(row);
+
+            var remove = el('button', 'wide danger', '🗑  Remove "' + addon.name + '"');
+            remove.addEventListener('click', function () {
+                addons.splice(index, 1);
+                saveAddons();
+                renderModal();
+            });
+            panel.appendChild(remove);
+        });
+
+        panel.appendChild(el('h2', null, 'Add one'));
+        var field = el('textarea');
+        field.placeholder = 'Paste an add-on here, or a link to one';
+        field.rows = 4;
+        field.style.cssText = 'width:100%;border-radius:10px;padding:10px;' +
+            'background:rgba(255,255,255,0.08);color:#fff;border:1px solid ' +
+            'rgba(255,255,255,0.25);font:inherit';
+        panel.appendChild(field);
+        var message = el('p', null, '');
+        panel.appendChild(message);
+
+        panel.appendChild(button('＋  Install', null, 'primary', function () {
+            var text = field.value.trim();
+            if (!text) return;
+            if (/^https?:\/\//i.test(text)) {
+                message.textContent = 'Loading…';
+                fetch(text).then(function (response) { return response.text(); })
+                    .then(function (body) {
+                        var error = addAddon(body, text);
+                        message.textContent = error || 'Installed. Reload to use it.';
+                        if (!error) renderModal();
+                    })
+                    .catch(function (e) {
+                        message.textContent = 'The link could not be loaded: ' + e.message;
+                    });
+                return;
+            }
+            var error = addAddon(text, 'pasted');
+            message.textContent = error || 'Installed. Reload to use it.';
+            if (!error) renderModal();
+        }));
+
+        panel.appendChild(button('📦  Install the example pack',
+            'Three blocks, two items, one creature, two recipes.', null,
+            function () {
+                fetch('addons/example.json')
+                    .then(function (response) { return response.text(); })
+                    .then(function (body) {
+                        var error = addAddon(body, 'Example pack');
+                        message.textContent = error || 'Installed. Reload to use it.';
+                        if (!error) renderModal();
+                    })
+                    .catch(function (e) {
+                        message.textContent = 'Could not load it: ' + e.message;
+                    });
+            }));
+
+        panel.appendChild(button('↻  Reload and apply', null, null, function () {
+            location.reload();
+        }));
+    }
+
     // ---------------------------------------------------------------- modal
     function openModal(kind) {
         modalKind = kind;
@@ -176,6 +412,7 @@ var CraftUI = (function () {
         if (modalKind === 'menu') renderMenu();
         else if (modalKind === 'inventory') renderInventory();
         else if (modalKind === 'death') renderDeath();
+        else if (modalKind === 'market') renderMarket();
         else if (modalKind === 'help') renderHelp();
     }
 
@@ -218,6 +455,11 @@ var CraftUI = (function () {
         panel.appendChild(button('🎒  Inventory and crafting', null, null, function () {
             openModal('inventory');
         }));
+        panel.appendChild(button('🛒  Marketplace — add-ons',
+            addons.length ? addons.length + ' installed' : 'blocks, items, creatures',
+            null, function () {
+                openModal('market');
+            }));
         panel.appendChild(button('?  How to play', null, null, function () {
             openModal('help');
         }));
@@ -563,6 +805,8 @@ var CraftUI = (function () {
         try {
             sensitivity = parseFloat(localStorage.getItem('craft.sensitivity') || '2.2');
         } catch (e) {}
+        loadAddons();
+        applyAddons();
         JSON.parse(text('craft_items_json')).forEach(function (type) {
             items[type.id] = type;
         });

@@ -89,6 +89,12 @@ async function diff(page, a, b) {
         { type: 'touchStart', touchPoints: [{ x, y }] });
     const touchEnd = () => cdp.send('Input.dispatchTouchEvent',
         { type: 'touchEnd', touchPoints: [] });
+    async function tapLocator(locator) {
+        const box = await locator.boundingBox();
+        await touchStart(box.x + Math.min(40, box.width / 2), box.y + box.height / 2);
+        await touchEnd();
+        await page.waitForTimeout(200);
+    }
     async function tap(selector, index) {
         const box = await (index === undefined
             ? page.locator(selector)
@@ -567,6 +573,57 @@ async function diff(page, a, b) {
         }
         check('phone: the gateway leads back home', back);
     }
+
+    // ---- marketplace ----
+    await tap('#menu-button');
+    await tapLocator(page.locator('#panel button', { hasText: 'Marketplace' }));
+    await page.waitForTimeout(400);
+    check('phone: the marketplace opens',
+        (await page.locator('#panel h1').textContent()).indexOf('Marketplace') >= 0);
+
+    // install the example pack, reload, and look for what it brought
+    await tapLocator(page.locator('#panel button', { hasText: 'example pack' }));
+    await page.waitForTimeout(1200);
+    const installed = await page.evaluate(() =>
+        JSON.parse(localStorage.getItem('craft.addons') || '[]').length);
+    check('phone: an add-on can be installed', installed === 1,
+        installed + ' installed');
+
+    await page.reload();
+    await page.waitForSelector('#controls:not(.hidden)', { timeout: 120000 });
+    await page.waitForTimeout(3000);
+    const addonState = await page.evaluate(() => ({
+        registered: Module._craft_addon_count(),
+        names: JSON.parse(Module.UTF8ToString(Module._craft_items_json()))
+            .filter(t => t.id >= 67 && t.id <= 127 || t.id >= 200)
+            .map(t => t.name)
+    }));
+    check('phone: the add-on things are in the game',
+        addonState.registered >= 5, JSON.stringify(addonState.names));
+    check('phone: an add-on block can be placed and mined',
+        await page.evaluate(() => {
+            const id = JSON.parse(Module.UTF8ToString(Module._craft_items_json()))
+                .find(t => t.name === 'Amber Block');
+            if (!id) return false;
+            Module._craft_set_game_mode(0);
+            Module._craft_select_slot(0);
+            Module._craft_inv_give(id.id, 1);
+            return Module._craft_inv_item(0) === id.id;
+        }));
+    await page.screenshot({ path: OUT + '/shot-10-addon.png' });
+
+    // and switching it off takes it away again
+    await page.evaluate(() => {
+        const list = JSON.parse(localStorage.getItem('craft.addons'));
+        list[0].enabled = false;
+        localStorage.setItem('craft.addons', JSON.stringify(list));
+    });
+    await page.reload();
+    await page.waitForSelector('#controls:not(.hidden)', { timeout: 120000 });
+    await page.waitForTimeout(2500);
+    check('phone: switching an add-on off removes its things',
+        await page.evaluate(() => Module._craft_addon_count()) === 0);
+    await page.evaluate(() => localStorage.removeItem('craft.addons'));
 
     // the world, the bag and the mode survive a reload
     await page.evaluate(() => Module._craft_save_now());

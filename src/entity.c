@@ -10,7 +10,8 @@
 // provided by main.c -- the only thing the creatures need from the world
 int entity_block_at(int x, int y, int z);
 
-static MobType types[MOB_KIND_COUNT];
+static MobType types[MAX_MOB_TYPES];
+static int type_count = MOB_KIND_COUNT;
 static Entity entities[MAX_ENTITIES];
 static Projectile projectiles[MAX_PROJECTILES];
 static double spawn_timer = 0;
@@ -42,6 +43,7 @@ static void add_type(
 
 void entities_init() {
     memset(types, 0, sizeof(types));
+    type_count = MOB_KIND_COUNT;
     //       kind            name          tile  w     h    hp   spd  dmg  see  rate  host night hop drop            n  dim
     add_type(MOB_HUSK,       "Husk",        80, 0.4, 1.9, 20, 2.6, 2.5, 26, 1.2, 1, 1, 0, ITEM_COAL,      1, 0);
     add_type(MOB_BONEWALKER, "Bonewalker",  81, 0.4, 1.9, 16, 2.9, 2.0, 30, 1.4, 1, 1, 0, ITEM_ARROW,     2, 0);
@@ -69,10 +71,28 @@ void entities_clear() {
 }
 
 MobType *mob_type(int kind) {
-    if (kind < 0 || kind >= MOB_KIND_COUNT) {
+    if (kind < 0 || kind >= type_count) {
         return 0;
     }
     return types + kind;
+}
+
+int mob_type_count() {
+    return type_count;
+}
+
+// An add-on creature: a colour, a few numbers, and the same rules as every
+// other creature. It lives in the overworld and comes out in the dark.
+int entity_register_type(const char *name, int tile, int health, float speed,
+    int damage, int hostile, int drop, int drop_count)
+{
+    if (type_count >= MAX_MOB_TYPES) {
+        return -1;
+    }
+    int kind = type_count++;
+    add_type(kind, name, tile, 0.45, 1.6, health, speed, damage, 24, 1.2,
+        hostile ? 1 : 0, 0, 0, drop, drop_count, 0);
+    return kind;
 }
 
 Entity *entity_at(int index) {
@@ -238,9 +258,9 @@ void entities_maybe_spawn(
         return;
     }
 
-    int candidates[MOB_KIND_COUNT];
+    int candidates[MAX_MOB_TYPES];
     int count = 0;
-    for (int kind = 0; kind < MOB_KIND_COUNT; kind++) {
+    for (int kind = 0; kind < type_count; kind++) {
         MobType *type = types + kind;
         if (type->dimension != dimension) {
             continue;

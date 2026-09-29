@@ -154,6 +154,21 @@ int plants[256] = {
     54, // 23 - blue flower
 };
 
+// Blocks an add-on registered at runtime. Bit 1 means transparent.
+static char addon_flags[256];
+
+void item_register_block(int w, int transparent) {
+    if (w <= 0 || w >= 256) {
+        return;
+    }
+    addon_flags[w] = 1 | (transparent ? 2 : 0);
+}
+
+int is_addon_block(int w) {
+    w = ABS(w);
+    return w > 0 && w < 256 && (addon_flags[w] & 1);
+}
+
 int is_plant(int w) {
     switch (w) {
         case TALL_GRASS:
@@ -205,6 +220,9 @@ int is_transparent(int w) {
     w = ABS(w);
     if (is_plant(w)) {
         return 1;
+    }
+    if (is_addon_block(w)) {
+        return (addon_flags[w] & 2) ? 1 : 0;
     }
     switch (w) {
         case EMPTY:

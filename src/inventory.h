@@ -66,6 +66,11 @@ typedef struct {
 } Recipe;
 
 void inventory_init();
+void inventory_register(
+    int id, const char *name, int kind, int block, int tile,
+    int stack, int damage, int heal, float cooldown);
+int inventory_register_recipe(int result, int count,
+    int item0, int count0, int item1, int count1);
 ItemType *item_type(int id);
 int item_is_block(int id);
 int block_drop(int w);

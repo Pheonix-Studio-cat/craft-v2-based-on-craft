@@ -82,6 +82,8 @@ int is_obstacle(int w);
 int is_transparent(int w);
 int is_destructable(int w);
 int is_liquid(int w);
+int is_addon_block(int w);
+void item_register_block(int w, int transparent);
 int is_light_source(int w);
 
 #endif

@@ -1,0 +1,21 @@
+{
+  "name": "Example pack",
+  "author": "the Craft repository",
+  "blocks": [
+    { "name": "Amber Block", "colour": "#d79a32", "speckle": 10 },
+    { "name": "Slate", "colour": "#4a5560", "speckle": 6 },
+    { "name": "Frosted Glass", "colour": "#bcd7e6", "speckle": 4, "seeThrough": true }
+  ],
+  "items": [
+    { "name": "Amber Shard", "kind": "material", "colour": "#e8b44a" },
+    { "name": "Amber Blade", "kind": "weapon", "colour": "#e8b44a", "damage": 6 }
+  ],
+  "creatures": [
+    { "name": "Amber Wisp", "colour": "#e8b44a", "health": 8, "speed": 3.0,
+      "damage": 2, "hostile": true, "drops": "Amber Shard", "dropCount": 2 }
+  ],
+  "recipes": [
+    { "makes": "Amber Block", "count": 1, "needs": [["Amber Shard", 4]] },
+    { "makes": "Amber Blade", "count": 1, "needs": [["Amber Shard", 2], ["Stick", 1]] }
+  ]
+}
