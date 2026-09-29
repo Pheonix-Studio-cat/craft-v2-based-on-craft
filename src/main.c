@@ -134,6 +134,8 @@ typedef struct {
     GLuint extra2;
     GLuint extra3;
     GLuint extra4;
+    GLuint extra5;
+    GLuint extra6;
 } Attrib;
 
 typedef struct {
@@ -164,6 +166,8 @@ typedef struct {
     float dy;            // vertical speed, kept here for the fall damage
     int dead;
     int dimension;       // 0 overworld, 1 underworld
+    float air;           // seconds of breath left under water
+    int underwater;      // the camera itself is in a liquid
     int paused;          // a menu is open: creatures wait
     float attack_timer;  // seconds until the next swing is allowed
     int scale;
@@ -1013,6 +1017,9 @@ void light_fill(
 
 void compute_chunk(WorkerItem *item) {
     char *opaque = (char *)calloc(XZ_SIZE * XZ_SIZE * Y_SIZE, sizeof(char));
+    // Water is transparent, so without this every face between two water
+    // blocks would be drawn -- a lake would cost thousands of hidden faces.
+    char *liquid = (char *)calloc(XZ_SIZE * XZ_SIZE * Y_SIZE, sizeof(char));
     char *light = (char *)calloc(XZ_SIZE * XZ_SIZE * Y_SIZE, sizeof(char));
     char *highest = (char *)calloc(XZ_SIZE * XZ_SIZE, sizeof(char));
 
@@ -1054,6 +1061,7 @@ void compute_chunk(WorkerItem *item) {
                 }
                 // END TODO
                 opaque[XYZ(x, y, z)] = !is_transparent(w);
+                liquid[XYZ(x, y, z)] = is_liquid(w);
                 if (opaque[XYZ(x, y, z)]) {
                     highest[XZ(x, z)] = MAX(highest[XZ(x, z)], y);
                 }
@@ -1092,12 +1100,14 @@ void compute_chunk(WorkerItem *item) {
         int x = ex - ox;
         int y = ey - oy;
         int z = ez - oz;
-        int f1 = !opaque[XYZ(x - 1, y, z)];
-        int f2 = !opaque[XYZ(x + 1, y, z)];
-        int f3 = !opaque[XYZ(x, y + 1, z)];
-        int f4 = !opaque[XYZ(x, y - 1, z)] && (ey > 0);
-        int f5 = !opaque[XYZ(x, y, z - 1)];
-        int f6 = !opaque[XYZ(x, y, z + 1)];
+        int wet = is_liquid(ew);
+        int f1 = !opaque[XYZ(x - 1, y, z)] && !(wet && liquid[XYZ(x - 1, y, z)]);
+        int f2 = !opaque[XYZ(x + 1, y, z)] && !(wet && liquid[XYZ(x + 1, y, z)]);
+        int f3 = !opaque[XYZ(x, y + 1, z)] && !(wet && liquid[XYZ(x, y + 1, z)]);
+        int f4 = !opaque[XYZ(x, y - 1, z)] && (ey > 0) &&
+            !(wet && liquid[XYZ(x, y - 1, z)]);
+        int f5 = !opaque[XYZ(x, y, z - 1)] && !(wet && liquid[XYZ(x, y, z - 1)]);
+        int f6 = !opaque[XYZ(x, y, z + 1)] && !(wet && liquid[XYZ(x, y, z + 1)]);
         int total = f1 + f2 + f3 + f4 + f5 + f6;
         if (total == 0) {
             continue;
@@ -1120,12 +1130,14 @@ void compute_chunk(WorkerItem *item) {
         int x = ex - ox;
         int y = ey - oy;
         int z = ez - oz;
-        int f1 = !opaque[XYZ(x - 1, y, z)];
-        int f2 = !opaque[XYZ(x + 1, y, z)];
-        int f3 = !opaque[XYZ(x, y + 1, z)];
-        int f4 = !opaque[XYZ(x, y - 1, z)] && (ey > 0);
-        int f5 = !opaque[XYZ(x, y, z - 1)];
-        int f6 = !opaque[XYZ(x, y, z + 1)];
+        int wet = is_liquid(ew);
+        int f1 = !opaque[XYZ(x - 1, y, z)] && !(wet && liquid[XYZ(x - 1, y, z)]);
+        int f2 = !opaque[XYZ(x + 1, y, z)] && !(wet && liquid[XYZ(x + 1, y, z)]);
+        int f3 = !opaque[XYZ(x, y + 1, z)] && !(wet && liquid[XYZ(x, y + 1, z)]);
+        int f4 = !opaque[XYZ(x, y - 1, z)] && (ey > 0) &&
+            !(wet && liquid[XYZ(x, y - 1, z)]);
+        int f5 = !opaque[XYZ(x, y, z - 1)] && !(wet && liquid[XYZ(x, y, z - 1)]);
+        int f6 = !opaque[XYZ(x, y, z + 1)] && !(wet && liquid[XYZ(x, y, z + 1)]);
         int total = f1 + f2 + f3 + f4 + f5 + f6;
         if (total == 0) {
             continue;
@@ -1180,6 +1192,7 @@ void compute_chunk(WorkerItem *item) {
     } END_MAP_FOR_EACH;
 
     free(opaque);
+    free(liquid);
     free(light);
     free(highest);
 
@@ -1702,9 +1715,12 @@ int render_chunks(Attrib *attrib, Player *player) {
     glUniform1i(attrib->sampler, 0);
     glUniform1i(attrib->extra1, 2);
     glUniform1f(attrib->extra2, light);
-    glUniform1f(attrib->extra3, g->render_radius * CHUNK_SIZE);
+    glUniform1f(attrib->extra3, g->underwater
+        ? CHUNK_SIZE * 0.6 : g->render_radius * CHUNK_SIZE);
     glUniform1i(attrib->extra4, g->ortho);
     glUniform1f(attrib->timer, time_of_day());
+    glUniform1f(attrib->extra5, glfwGetTime());
+    glUniform1f(attrib->extra6, g->underwater ? 1.0 : 0.0);
     for (int i = 0; i < g->chunk_count; i++) {
         Chunk *chunk = g->chunks + i;
         if (chunk_distance(chunk, p, q) > g->render_radius) {
@@ -1848,6 +1864,7 @@ void render_sky(Attrib *attrib, Player *player, GLuint buffer) {
     glUniformMatrix4fv(attrib->matrix, 1, GL_FALSE, matrix);
     glUniform1i(attrib->sampler, 2);
     glUniform1f(attrib->timer, time_of_day());
+    glUniform1f(attrib->extra1, g->underwater ? 1.0 : 0.0);
     draw_triangles_3d(attrib, buffer, 512 * 3);
 }
 
@@ -2267,6 +2284,56 @@ void parse_command(const char *buffer, int forward) {
 }
 
 // ---------------------------------------------------------------------------
+// water
+// ---------------------------------------------------------------------------
+
+#define MAX_AIR 14
+
+int block_at_player(float dy) {
+    State *s = &g->players->state;
+    return get_block(roundf(s->x), roundf(s->y + dy), roundf(s->z));
+}
+
+// Water runs into the hole that was just dug. Not a full liquid simulation:
+// a breadth-first fill of at most 64 cells, fed by whatever water already
+// touches them. Enough to flood a tunnel into a lake, cheap enough for a
+// phone.
+void flood_water(int x, int y, int z) {
+    Block queue[64];
+    int head = 0;
+    int tail = 0;
+    queue[tail++] = (Block){x, y, z, 0};
+    while (head < tail) {
+        Block cell = queue[head++];
+        if (cell.y < 0 || cell.y > 255) {
+            continue;
+        }
+        if (get_block(cell.x, cell.y, cell.z) != EMPTY) {
+            continue;
+        }
+        int fed =
+            get_block(cell.x, cell.y + 1, cell.z) == WATER ||
+            get_block(cell.x - 1, cell.y, cell.z) == WATER ||
+            get_block(cell.x + 1, cell.y, cell.z) == WATER ||
+            get_block(cell.x, cell.y, cell.z - 1) == WATER ||
+            get_block(cell.x, cell.y, cell.z + 1) == WATER;
+        if (!fed) {
+            continue;
+        }
+        set_block(cell.x, cell.y, cell.z, WATER);
+        // downwards first, then sideways
+        int steps[5][3] = {
+            {0, -1, 0}, {-1, 0, 0}, {1, 0, 0}, {0, 0, -1}, {0, 0, 1}
+        };
+        for (int i = 0; i < 5 && tail < 64; i++) {
+            queue[tail++] = (Block){
+                cell.x + steps[i][0], cell.y + steps[i][1],
+                cell.z + steps[i][2], 0};
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // survival
 // ---------------------------------------------------------------------------
 
@@ -2311,6 +2378,7 @@ void respawn_player() {
     g->health = MAX_HEALTH;
     g->hurt_timer = 0;
     g->regen_timer = 0;
+    g->air = MAX_AIR;
     g->dead = 0;
 }
 
@@ -2332,13 +2400,45 @@ void set_game_mode(int mode) {
 // Health comes back on its own once nothing has hurt the player for a while.
 // No hunger bar: on a touch screen one more thing to watch is one too many.
 void survival_tick(double dt) {
+    int head = block_at_player(0);
+    g->underwater = is_liquid(head);
+
     if (g->game_mode != GAME_SURVIVAL) {
         g->health = MAX_HEALTH;
+        g->air = MAX_AIR;
         g->dead = 0;
         return;
     }
     if (g->dead) {
         return;
+    }
+
+    // breath, and what happens when it runs out
+    if (head == WATER) {
+        g->air -= dt;
+        if (g->air < 0) {
+            g->air = 0;
+            g->regen_timer += dt;
+            if (g->regen_timer >= 1) {
+                g->regen_timer = 0;
+                hurt_player(2);
+            }
+        }
+    }
+    else {
+        g->air += dt * 3;
+        if (g->air > MAX_AIR) {
+            g->air = MAX_AIR;
+        }
+    }
+    // lava is not a place to stand
+    if (head == LAVA || block_at_player(-1) == LAVA) {
+        g->hurt_timer = 6;
+        g->regen_timer += dt;
+        if (g->regen_timer >= 0.5) {
+            g->regen_timer = 0;
+            hurt_player(3);
+        }
     }
     if (g->hurt_timer > 0) {
         g->hurt_timer -= dt;
@@ -2436,6 +2536,7 @@ void on_left_click() {
         if (is_plant(get_block(hx, hy + 1, hz))) {
             set_block(hx, hy + 1, hz, 0);
         }
+        flood_water(hx, hy, hz);
         // In survival the block goes into the bag; in creative it is gone,
         // because there the bag is bottomless anyway.
         if (g->game_mode == GAME_SURVIVAL) {
@@ -2779,6 +2880,11 @@ EMSCRIPTEN_KEEPALIVE int craft_max_health() {
     return MAX_HEALTH;
 }
 
+// 0 .. 100, how much breath is left; 100 also means "not under water"
+EMSCRIPTEN_KEEPALIVE int craft_air() {
+    return (int)(100 * g->air / MAX_AIR);
+}
+
 EMSCRIPTEN_KEEPALIVE int craft_is_dead() {
     return g->dead;
 }
@@ -2890,6 +2996,21 @@ EMSCRIPTEN_KEEPALIVE float craft_probe(int what) {
     if (what == 12) return best->health;
     if (what == 8) return best->dy;
     return 0;
+}
+
+// Two more for tools and tests: what is in a given block, and putting the
+// player somewhere. Both are plain reads and writes of state the player can
+// reach anyway.
+EMSCRIPTEN_KEEPALIVE int craft_block_at(int x, int y, int z) {
+    return get_block(x, y, z);
+}
+
+EMSCRIPTEN_KEEPALIVE void craft_teleport(float x, float y, float z) {
+    State *s = &g->players->state;
+    s->x = x;
+    s->y = y;
+    s->z = z;
+    g->dy = 0;
 }
 
 EMSCRIPTEN_KEEPALIVE int craft_is_paused() {
@@ -3087,12 +3208,19 @@ void handle_movement(double dt) {
             if (g->flying) {
                 vy = 1;
             }
+            else if (is_liquid(block_at_player(0)) ||
+                     is_liquid(block_at_player(-1)))
+            {
+                g->dy = 4;     // paddle upwards
+            }
             else if (g->dy == 0) {
                 g->dy = 8;
             }
         }
     }
-    float speed = g->flying ? 20 : 5;
+    // swimming: slower, gentler gravity, and the jump button paddles up
+    int in_liquid = is_liquid(block_at_player(0)) || is_liquid(block_at_player(-1));
+    float speed = g->flying ? 20 : (in_liquid ? 3 : 5);
 #ifdef __EMSCRIPTEN__
     // A stick pushed halfway walks at half speed.
     if ((sx || sz) && touch.move_scale > 0) {
@@ -3112,6 +3240,10 @@ void handle_movement(double dt) {
         if (g->flying) {
             g->dy = 0;
         }
+        else if (in_liquid) {
+            g->dy -= ut * 8;
+            g->dy = MAX(g->dy, -3);    // sinking, not falling
+        }
         else {
             g->dy -= ut * 25;
             g->dy = MAX(g->dy, -250);
@@ -3122,7 +3254,7 @@ void handle_movement(double dt) {
         if (collide(2, &s->x, &s->y, &s->z)) {
             // Landing: the speed says how far the fall was. Four blocks are
             // free, everything above that hurts.
-            if (g->dy < 0) {
+            if (g->dy < 0 && !in_liquid) {
                 float distance = (g->dy * g->dy) / 50.0;
                 if (distance > 4) {
                     hurt_player(distance - 4);
@@ -3244,6 +3376,8 @@ void reset_model() {
     g->item_index = 0;
     g->dy = 0;
     g->dead = 0;
+    g->air = MAX_AIR;
+    g->underwater = 0;
     g->paused = 0;
     g->attack_timer = 0;
     g->dimension = 0;
@@ -3358,6 +3492,8 @@ int main(int argc, char **argv) {
     block_attrib.extra4 = glGetUniformLocation(program, "ortho");
     block_attrib.camera = glGetUniformLocation(program, "camera");
     block_attrib.timer = glGetUniformLocation(program, "timer");
+    block_attrib.extra5 = glGetUniformLocation(program, "wave");
+    block_attrib.extra6 = glGetUniformLocation(program, "underwater");
 
     program = load_program(
         "shaders/line_vertex.glsl", "shaders/line_fragment.glsl");
@@ -3383,6 +3519,7 @@ int main(int argc, char **argv) {
     sky_attrib.matrix = glGetUniformLocation(program, "matrix");
     sky_attrib.sampler = glGetUniformLocation(program, "sampler");
     sky_attrib.timer = glGetUniformLocation(program, "timer");
+    sky_attrib.extra1 = glGetUniformLocation(program, "underwater");
 
     // CHECK COMMAND LINE ARGUMENTS //
     if (argc == 2 || argc == 3) {

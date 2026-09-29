@@ -12,7 +12,8 @@
 var CraftUI = (function () {
     'use strict';
 
-    var canvas, controls, modal, panel, loading, statusLine, bar, hotbarEl, heartsEl;
+    var canvas, controls, modal, panel, loading, statusLine, bar, hotbarEl;
+    var heartsEl, bubblesEl;
     var items = {};          // id -> {id, name, kind, block, tile, stack, damage, heal}
     var recipes = [];
     var atlas = new Image();
@@ -22,6 +23,7 @@ var CraftUI = (function () {
     var ready = false;       // the wasm runtime answers only after it is
     var lastVersion = -1;
     var lastHealth = -1;
+    var lastAir = -1;
     var pickedSlot = -1;
     var currentTab = 'bag';
     var modalKind = null;
@@ -124,6 +126,19 @@ var CraftUI = (function () {
             var full = health >= (i + 1) * 2;
             var half = !full && health === i * 2 + 1;
             heartsEl.appendChild(el('div', 'heart' + (full ? ' full' : half ? ' half' : '')));
+        }
+    }
+
+    // Bubbles only show up while there is a reason to watch them.
+    function renderAir() {
+        var air = call('craft_air');
+        var show = call('craft_game_mode') === 1 && air < 100;
+        bubblesEl.classList.toggle('hidden', !show);
+        if (!show) return;
+        bubblesEl.innerHTML = '';
+        for (var i = 0; i < 10; i++) {
+            bubblesEl.appendChild(el('div',
+                'bubble' + (air > i * 10 ? ' full' : '')));
         }
     }
 
@@ -517,6 +532,11 @@ var CraftUI = (function () {
             lastHealth = health;
             renderHearts();
         }
+        var air = call('craft_air');
+        if (air !== lastAir) {
+            lastAir = air;
+            renderAir();
+        }
         if (call('craft_is_dead') && modalKind !== 'death') {
             openModal('death');
         }
@@ -552,6 +572,7 @@ var CraftUI = (function () {
         buildHotbar();
         renderHotbar();
         renderHearts();
+        renderAir();
         updateButtons();
         resize();
         setInterval(poll, 200);
@@ -574,6 +595,7 @@ var CraftUI = (function () {
         bar = document.querySelector('#bar > div');
         hotbarEl = document.getElementById('hotbar');
         heartsEl = document.getElementById('hearts');
+        bubblesEl = document.getElementById('bubbles');
 
         atlas.onload = function () {
             atlasReady = true;

@@ -58,6 +58,8 @@
 #define DELETE_CHUNK_RADIUS 14
 #endif
 #define CHUNK_SIZE 32
+// the terrain floor sits at 12, so the sea is two blocks deep
+#define SEA_LEVEL 14
 #define COMMIT_INTERVAL 5
 
 #endif

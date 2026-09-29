@@ -134,6 +134,21 @@ canvas { display: block; width: 100%; height: 100%; touch-action: none; outline:
     background: linear-gradient(90deg, #e2453c 50%, rgba(0, 0, 0, 0.35) 50%);
 }
 
+#bubbles {
+    position: absolute;
+    left: max(var(--pad), env(safe-area-inset-left));
+    top: calc(max(var(--pad), env(safe-area-inset-top)) + 48px);
+    display: flex;
+    gap: 3px;
+}
+.bubble {
+    width: 13px;
+    height: 13px;
+    border-radius: 50%;
+    background: rgba(0, 0, 0, 0.3);
+}
+.bubble.full { background: #9fd8f5; box-shadow: inset -2px -2px 0 rgba(0, 0, 0, 0.18); }
+
 /* hotbar */
 #hotbar {
     position: absolute;

@@ -367,6 +367,87 @@ async function diff(page, a, b) {
     });
     check('phone: shooting uses up bolts', boltsLeft < 30, boltsLeft + ' of 30 left');
 
+    // ---- water ----
+    // Find a water block in the world, stand in it, and watch the breath go.
+    const water = await page.evaluate(() => {
+        for (let r = 2; r < 80; r += 2) {
+            for (let dx = -r; dx <= r; dx += 2) {
+                for (let dz = -r; dz <= r; dz += 2) {
+                    if (Module._craft_block_at(dx, 13, dz) === 24) return [dx, dz];
+                }
+            }
+        }
+        return null;
+    });
+    check('phone: the world generator made water', water !== null,
+        water ? 'first pool at ' + water : 'none within 80 blocks');
+
+    if (water) {
+        await page.evaluate(([x, z]) => {
+            Module._craft_clear_mobs();
+            Module._craft_set_game_mode(1);
+            Module._craft_teleport(x, 13.2, z);
+        }, water);
+        await page.waitForTimeout(2500);
+        const wet = await page.evaluate(() => ({
+            air: Module._craft_air(),
+            health: Module._craft_health(),
+            head: Module._craft_block_at(
+                Math.round(Module._craft_probe(0)),
+                Math.round(Module._craft_probe(1)),
+                Math.round(Module._craft_probe(2)))
+        }));
+        check('phone: standing in water uses up breath',
+            wet.air < 100 && wet.head === 24,
+            'breath ' + wet.air + '%, block at the head ' + wet.head);
+        check('phone: the bubbles show up',
+            await page.locator('#bubbles .bubble').count() === 10);
+        await page.screenshot({ path: OUT + '/shot-07-underwater.png' });
+
+        // drowning costs health, but only after a while
+        await page.waitForTimeout(14000);
+        const drowned = await page.evaluate(() => ({
+            air: Module._craft_air(), health: Module._craft_health()
+        }));
+        check('phone: running out of breath costs health', drowned.health < 20,
+            'breath ' + drowned.air + '%, health ' + drowned.health);
+
+        await page.evaluate(() => {
+            Module._craft_respawn();
+            Module._craft_set_game_mode(0);
+            Module._craft_toggle_fly();
+            Module._craft_touch_jump(1);
+        });
+        await page.waitForTimeout(2600);
+        await page.evaluate(() => {
+            Module._craft_touch_jump(0);
+            Module._craft_touch_look(0, 200);   // look down at the landscape
+        });
+        await page.waitForTimeout(900);
+        const sky = await page.screenshot({ clip: { x: 0, y: 120, width: 390, height: 420 } });
+        await page.screenshot({ path: OUT + '/shot-08-from-above.png' });
+        const blue = await page.evaluate(async (data) => {
+            const img = new Image();
+            img.src = 'data:image/png;base64,' + data;
+            await img.decode();
+            const c = new OffscreenCanvas(img.width, img.height);
+            const g = c.getContext('2d');
+            g.drawImage(img, 0, 0);
+            const px = g.getImageData(0, 0, img.width, img.height).data;
+            let water = 0;
+            for (let i = 0; i < px.length; i += 4) {
+                // the water tile is a deep blue; the sky above is much paler
+                if (px[i] < 90 && px[i + 1] > 50 && px[i + 1] < 150 && px[i + 2] > 140) {
+                    water++;
+                }
+            }
+            return water / (px.length / 4);
+        }, sky.toString('base64'));
+        check('phone: water can be seen in the landscape', blue > 0.01,
+            (100 * blue).toFixed(1) + '% of the picture');
+        await page.evaluate(() => { Module._craft_toggle_fly(); });
+    }
+
     // the world, the bag and the mode survive a reload
     await page.evaluate(() => Module._craft_save_now());
     await page.waitForTimeout(1500);

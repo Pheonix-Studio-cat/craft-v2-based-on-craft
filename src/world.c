@@ -1,4 +1,5 @@
 #include "config.h"
+#include "item.h"
 #include "noise.h"
 #include "world.h"
 
@@ -26,7 +27,11 @@ void create_world(int p, int q, world_func func, void *arg) {
             for (int y = 0; y < h; y++) {
                 func(x, y, z, w * flag, arg);
             }
-            if (w == 1) {
+            // water fills everything the land does not reach up to
+            for (int y = h; y < SEA_LEVEL; y++) {
+                func(x, y, z, WATER * flag, arg);
+            }
+            if (w == 1 && h >= SEA_LEVEL) {
                 if (SHOW_PLANTS) {
                     // grass
                     if (simplex2(-x * 0.1, z * 0.1, 4, 0.8, 2) > 0.6) {
