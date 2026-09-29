@@ -205,7 +205,7 @@ async function diff(page, a, b) {
         afterCraft.some(s => s[0] === 8),      // 8 = PLANK
         JSON.stringify(afterCraft));
     await page.screenshot({ path: OUT + '/shot-02-crafting.png' });
-    await tap('#panel button.primary');        // back to the game
+    await tap('#panel .close');                // back to the game
 
     // falling hurts, and enough of it kills
     await page.evaluate(() => {
@@ -233,6 +233,139 @@ async function diff(page, a, b) {
         await tap('#panel button.primary');
         check('phone: respawn brings the player back', (await state()).dead === 0);
     }
+
+    // ---- creatures ----
+    check('phone: closing a panel lets the world run again',
+        await page.evaluate(() => Module._craft_is_paused()) === 0);
+    await page.evaluate(() => {
+        Module._craft_set_game_mode(1);
+        Module._craft_respawn();
+        Module._craft_clear_mobs();         // measure against a known state
+        // put a real blade in the hand: by now the hotbar holds whatever the
+        // earlier steps left there, and a lump of dirt hits for 1
+        Module._craft_set_game_mode(0);
+        Module._craft_select_slot(1);
+        Module._craft_inv_give(140, 1);     // iron blade
+        Module._craft_set_game_mode(1);
+        // A slime hops towards the player, so it aims itself -- a boar
+        // wanders off and the measurement becomes a coin toss.
+        Module._craft_spawn_mob(5);
+    });
+    await page.waitForTimeout(600);
+    const spawned = await page.evaluate(() => ({
+        count: Module._craft_entity_count(),
+        distance: Module._craft_nearest_mob(),
+        paused: Module._craft_is_paused(),
+        modal: document.getElementById('modal').className
+    }));
+    check('phone: a creature can be put into the world', spawned.count === 1,
+        'count ' + spawned.count + ', ' + spawned.distance.toFixed(1) +
+        ' blocks away, paused=' + spawned.paused + ', modal="' + spawned.modal + '"');
+    await page.screenshot({ path: OUT + '/shot-05-creature.png' });
+
+    // hitting it takes it apart and the drop lands in the bag
+    const gems = async () => (await state()).bag
+        .filter(s => s[0] === 131).reduce((n, s) => n + s[1], 0);
+    const gemsBefore = await gems();
+    let killed = false;
+    for (let i = 0; i < 20 && !killed; i++) {
+        await tap('#break');
+        await page.waitForTimeout(320);
+        killed = (await gems()) > gemsBefore;
+        if (process.env.VERBOSE) {
+            console.log('    Schlag', i, JSON.stringify(await page.evaluate(() => ({
+                n: Module._craft_entity_count(),
+                d: +Module._craft_nearest_mob().toFixed(2),
+                hp: +Module._craft_probe(12).toFixed(1),
+                mob: [3, 4, 5].map(i => +Module._craft_probe(i).toFixed(1)),
+                me: [0, 1, 2].map(i => +Module._craft_probe(i).toFixed(1)),
+                paused: Module._craft_is_paused()
+            }))));
+        }
+    }
+    check('phone: a creature can be defeated with the blade', killed);
+    // a gem can only come from a slime, so this is proof, not a hint
+    check('phone: what it drops lands in the bag', (await gems()) > gemsBefore,
+        'gems ' + gemsBefore + ' -> ' + (await gems()));
+
+    // a hostile creature actually hurts
+    await page.evaluate(() => {
+        Module._craft_respawn();
+        Module._craft_clear_mobs();
+        Module._craft_spawn_mob(2);         // stalker: hunts by day too
+    });
+    for (let i = 0; i < 6; i++) {
+        await page.waitForTimeout(900);
+        if (process.env.VERBOSE) {
+            console.log('   ', JSON.stringify(await page.evaluate(() => ({
+                player: [0, 1, 2].map(i => +Module._craft_probe(i).toFixed(2)),
+                mob: [3, 4, 5].map(i => +Module._craft_probe(i).toFixed(2)),
+                ticks: Module._craft_probe(7),
+                paused: Module._craft_is_paused(),
+                mode: Module._craft_game_mode(),
+                dy: +Module._craft_probe(8).toFixed(2),
+                health: Module._craft_health()
+            }))));
+        }
+    }
+    const hurt = await page.evaluate(() => ({
+        health: Module._craft_health(),
+        count: Module._craft_entity_count(),
+        distance: Module._craft_nearest_mob(),
+        player: [0, 1, 2].map(i => +Module._craft_probe(i).toFixed(1)),
+        mob: [3, 4, 5].map(i => +Module._craft_probe(i).toFixed(1))
+    }));
+    check('phone: a hostile creature costs health', hurt.health < 20,
+        'health ' + hurt.health + ', ' + hurt.count + ' creatures, player at ' +
+        hurt.player + ', creature at ' + hurt.mob);
+
+    // ... but not while a menu is open
+    await tap('#menu-button');
+    const pausedBefore = (await state()).health;
+    await page.waitForTimeout(3500);
+    const pausedAfter = (await state()).health;
+    check('phone: creatures wait while the menu is open',
+        pausedAfter === pausedBefore,
+        pausedBefore + ' -> ' + pausedAfter);
+    await tap('#panel button.primary');
+
+    // the crossbow shoots
+    await page.evaluate(() => {
+        Module._craft_respawn();
+        Module._craft_clear_mobs();
+        Module._craft_set_game_mode(0);
+        Module._craft_select_slot(1);
+        Module._craft_inv_give(134, 30);    // bolts
+        Module._craft_select_slot(0);
+        Module._craft_inv_give(150, 1);     // crossbow
+        Module._craft_set_game_mode(1);     // survival, so the drop is kept
+        // a stalker walks straight at the player: it aims itself
+        Module._craft_spawn_mob(2);
+    });
+    await page.waitForTimeout(900);
+    const coal = async () => (await state()).bag
+        .filter(s => s[0] === 129).reduce((n, s) => n + s[1], 0);
+    const coalBefore = await coal();
+    let shot_down = false;
+    for (let i = 0; i < 12 && !shot_down; i++) {
+        await tap('#break');
+        if (i === 0) {
+            await page.waitForTimeout(60);
+            await page.screenshot({ path: OUT + '/shot-06-bolt.png' });
+        }
+        await page.waitForTimeout(450);
+        shot_down = (await coal()) > coalBefore;
+    }
+    check('phone: the crossbow brings a creature down', shot_down,
+        'coal ' + coalBefore + ' -> ' + (await coal()));
+    const boltsLeft = await page.evaluate(() => {
+        let n = 0;
+        for (let i = 0; i < 36; i++) {
+            if (Module._craft_inv_item(i) === 134) n += Module._craft_inv_count(i);
+        }
+        return n;
+    });
+    check('phone: shooting uses up bolts', boltsLeft < 30, boltsLeft + ' of 30 left');
 
     // the world, the bag and the mode survive a reload
     await page.evaluate(() => Module._craft_save_now());

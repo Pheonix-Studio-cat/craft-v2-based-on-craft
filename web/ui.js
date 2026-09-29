@@ -130,9 +130,11 @@ var CraftUI = (function () {
     // ---------------------------------------------------------------- modal
     function openModal(kind) {
         modalKind = kind;
-        // let go of the controls, or the player walks on behind the menu
+        // let go of the controls, or the player walks on behind the menu,
+        // and hold the creatures: nothing should eat anyone through a menu
         call('craft_touch_move', 0, 0, 0);
         call('craft_touch_jump', 0);
+        call('craft_set_paused', 1);
         stickRelease();
         modal.classList.remove('hidden');
         renderModal();
@@ -142,12 +144,20 @@ var CraftUI = (function () {
         modalKind = null;
         pickedSlot = -1;
         modal.classList.add('hidden');
+        call('craft_set_paused', 0);
         call('craft_save_now');
     }
 
     function renderModal() {
         if (!modalKind) return;
         panel.innerHTML = '';
+        // A panel can be long -- the crafting list is. The way out stays
+        // pinned at the top, so it is never below the fold.
+        if (modalKind !== 'death') {
+            var close = el('button', 'close', '✕');
+            close.addEventListener('click', closeModal);
+            panel.appendChild(close);
+        }
         if (modalKind === 'menu') renderMenu();
         else if (modalKind === 'inventory') renderInventory();
         else if (modalKind === 'death') renderDeath();
@@ -367,7 +377,9 @@ var CraftUI = (function () {
         var list = el('ul');
         [['Look', 'drag anywhere on the world'],
          ['Walk', 'the stick at the bottom left'],
-         ['⛏ / ▣', 'break and place the block in the crosshair'],
+         ['⛏', 'mine the block in the crosshair — or hit the creature in it'],
+         ['▣', 'place the block that is in the selected slot'],
+         ['Crossbow', 'select it in the hotbar, then ⛏ shoots a bolt'],
          ['🎒', 'inventory and crafting'],
          ['✈', 'flying, creative mode only'],
          ['Keyboard', 'WASD, space, 1–9, tab']
@@ -507,6 +519,11 @@ var CraftUI = (function () {
         }
         if (call('craft_is_dead') && modalKind !== 'death') {
             openModal('death');
+        }
+        else if (modalKind === 'death' && !call('craft_is_dead')) {
+            // alive again without going through the button -- do not leave
+            // the world paused behind a panel nobody can close
+            closeModal();
         }
     }
 

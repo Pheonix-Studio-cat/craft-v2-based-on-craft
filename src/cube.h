@@ -7,6 +7,16 @@ void make_cube_faces(
     int wleft, int wright, int wtop, int wbottom, int wfront, int wback,
     float x, float y, float z, float n);
 
+void make_box_faces(
+    float *data, float ao[6][4], float light[6][4],
+    int left, int right, int top, int bottom, int front, int back,
+    int wleft, int wright, int wtop, int wbottom, int wfront, int wback,
+    float x, float y, float z, float nx, float ny, float nz);
+
+void make_mob(
+    float *data, float x, float y, float z, float rx,
+    int tile, float width, float height, float light_value);
+
 void make_cube(
     float *data, float ao[6][4], float light[6][4],
     int left, int right, int top, int bottom, int front, int back,

@@ -191,6 +191,22 @@ canvas { display: block; width: 100%; height: 100%; touch-action: none; outline:
     background: var(--ui-solid);
     border: 1px solid rgba(255, 255, 255, 0.16);
 }
+#panel { position: relative; }
+#panel .close {
+    position: sticky;
+    top: -18px;
+    float: right;
+    width: 38px;
+    height: 38px;
+    margin: -8px -6px 0 0;
+    border-radius: 50%;
+    border: 1px solid var(--edge);
+    background: rgba(255, 255, 255, 0.16);
+    color: #fff;
+    font: inherit;
+    font-size: 17px;
+    z-index: 2;
+}
 #panel h1 { margin: 0 0 4px; font-size: 21px; letter-spacing: 0.04em; }
 #panel h2 { margin: 18px 0 8px; font-size: 14px; text-transform: uppercase;
             letter-spacing: 0.08em; opacity: 0.6; }

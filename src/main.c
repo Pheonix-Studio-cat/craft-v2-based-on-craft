@@ -18,6 +18,7 @@
 #include "config.h"
 #include "cube.h"
 #include "db.h"
+#include "entity.h"
 #include "inventory.h"
 #include "item.h"
 #include "map.h"
@@ -162,6 +163,9 @@ typedef struct {
     float regen_timer;
     float dy;            // vertical speed, kept here for the fall damage
     int dead;
+    int dimension;       // 0 overworld, 1 underworld
+    int paused;          // a menu is open: creatures wait
+    float attack_timer;  // seconds until the next swing is allowed
     int scale;
     int ortho;
     float fov;
@@ -186,6 +190,7 @@ static Model *g = &model;
 // nothing at all -- these four are the exception.
 int held_item();
 ItemType *held_type();
+void on_left_click();
 void hurt_player(float amount);
 void save_player_meta();
 
@@ -1645,6 +1650,9 @@ void record_block(int x, int y, int z, int w) {
     g->block0.w = w;
 }
 
+// What entity.c asks the world.
+int entity_block_at(int x, int y, int z);
+
 int get_block(int x, int y, int z) {
     int p = chunked(x);
     int q = chunked(z);
@@ -1654,6 +1662,13 @@ int get_block(int x, int y, int z) {
         return map_get(map, x, y, z);
     }
     return 0;
+}
+
+int entity_block_at(int x, int y, int z) {
+    if (y < 0 || y >= 256) {
+        return y < 0 ? STONE : EMPTY;
+    }
+    return get_block(x, y, z);
 }
 
 void builder_block(int x, int y, int z, int w) {
@@ -1777,6 +1792,49 @@ void render_players(Attrib *attrib, Player *player) {
         if (other != player) {
             draw_player(attrib, other);
         }
+    }
+}
+
+GLuint gen_mob_buffer(Entity *e, MobType *type, float light) {
+    GLfloat *data = malloc_faces(10, 12);
+    make_mob(data, e->x, e->y, e->z, e->rx, type->tile,
+        type->width, type->height, light);
+    return gen_faces(10, 12, data);
+}
+
+void render_entities(Attrib *attrib, Player *player) {
+    State *s = &player->state;
+    float matrix[16];
+    set_matrix_3d(
+        matrix, g->width, g->height,
+        s->x, s->y, s->z, s->rx, s->ry, g->fov, g->ortho, g->render_radius);
+    glUseProgram(attrib->program);
+    glUniformMatrix4fv(attrib->matrix, 1, GL_FALSE, matrix);
+    glUniform3f(attrib->camera, s->x, s->y, s->z);
+    glUniform1i(attrib->sampler, 0);
+    glUniform1f(attrib->timer, time_of_day());
+    for (int i = 0; i < MAX_ENTITIES; i++) {
+        Entity *e = entity_at(i);
+        if (!e->used) {
+            continue;
+        }
+        MobType *type = mob_type(e->kind);
+        // a creature that was just hit flashes bright for a moment
+        float light = e->hurt_flash > 0 ? 1.6 : 0.75;
+        GLuint buffer = gen_mob_buffer(e, type, light);
+        draw_triangles_3d_ao(attrib, buffer, 12 * 6);
+        del_buffer(buffer);
+    }
+    for (int i = 0; i < MAX_PROJECTILES; i++) {
+        Projectile *p = projectile_at(i);
+        if (!p->used) {
+            continue;
+        }
+        GLfloat *data = malloc_faces(10, 4);
+        make_sprite(data, 0, 1, p->x, p->y, p->z, 0.18, 102, 45);
+        GLuint buffer = gen_faces(10, 4, data);
+        draw_triangles_3d_ao(attrib, buffer, 4 * 6);
+        del_buffer(buffer);
     }
 }
 
@@ -2243,6 +2301,7 @@ void heal_player(float amount) {
 
 void respawn_player() {
     State *s = &g->players->state;
+    entities_clear();
     s->x = 0;
     s->z = 0;
     s->y = highest_block(s->x, s->z) + 2;
@@ -2320,6 +2379,48 @@ void on_light() {
     if (hy > 0 && hy < 256 && is_destructable(hw)) {
         toggle_light(hx, hy, hz);
     }
+}
+
+// Swinging, shooting, or mining -- decided by what is in the hand and what
+// is in the crosshair.
+void attack_or_shoot() {
+    State *s = &g->players->state;
+    ItemType *type = held_type();
+    float vx, vy, vz;
+    get_sight_vector(s->rx, s->ry, &vx, &vy, &vz);
+
+    if (type && type->kind == KIND_RANGED) {
+        if (g->attack_timer > 0) {
+            return;
+        }
+        if (g->game_mode == GAME_SURVIVAL && !inv_take(ITEM_ARROW, 1)) {
+            add_message("Out of bolts.");
+            return;
+        }
+        g->attack_timer = type->cooldown;
+        projectile_spawn(s->x, s->y - 0.2, s->z,
+            vx * 26, vy * 26, vz * 26, type->damage);
+        return;
+    }
+
+    int index = entity_pick(s->x, s->y, s->z, vx, vy, vz, 4.5);
+    if (index < 0) {
+        index = entity_pick_near(s->x, s->y, s->z, vx, vz, 2.5);
+    }
+    if (index >= 0) {
+        if (g->attack_timer > 0) {
+            return;
+        }
+        float damage = type && type->damage > 1 ? type->damage : 1;
+        g->attack_timer = type ? type->cooldown : 0.35;
+        int count = 0;
+        int drop = entity_damage(index, damage, &count);
+        if (drop && g->game_mode == GAME_SURVIVAL) {
+            inv_add(drop, count);
+        }
+        return;
+    }
+    on_left_click();
 }
 
 void on_left_click() {
@@ -2638,7 +2739,7 @@ EMSCRIPTEN_KEEPALIVE int craft_is_flying() {
 }
 
 EMSCRIPTEN_KEEPALIVE void craft_break_block() {
-    on_left_click();
+    attack_or_shoot();
 }
 
 EMSCRIPTEN_KEEPALIVE void craft_place_block() {
@@ -2743,6 +2844,91 @@ EMSCRIPTEN_KEEPALIVE int craft_do_craft(int index) {
 
 EMSCRIPTEN_KEEPALIVE void craft_use_item() {
     use_held_item();
+}
+
+// A menu is open: creatures wait instead of eating the player behind it.
+EMSCRIPTEN_KEEPALIVE void craft_set_paused(int paused) {
+    g->paused = paused ? 1 : 0;
+}
+
+// A handful of numbers for tools/smoke-test.js -- a test that can only see
+// pixels cannot tell "the creature is stuck" from "the creature is missing".
+//
+//   0..2  player x/y/z        7  creature ticks since the start
+//   3..5  nearest creature    8  its vertical speed
+//   6     its kind            9  the player's vertical speed
+//   12    its health         10  hurt timer, 11 health as a float
+EMSCRIPTEN_KEEPALIVE float craft_probe(int what) {
+    State *s = &g->players->state;
+    if (what == 0) return s->x;
+    if (what == 1) return s->y;
+    if (what == 2) return s->z;
+    if (what == 7) return entities_tick_count();
+    if (what == 9) return g->dy;
+    if (what == 10) return g->hurt_timer;
+    if (what == 11) return g->health;
+    Entity *best = 0;
+    float best_distance = 0;
+    for (int i = 0; i < MAX_ENTITIES; i++) {
+        Entity *e = entity_at(i);
+        if (!e->used) {
+            continue;
+        }
+        float dx = e->x - s->x;
+        float dz = e->z - s->z;
+        float distance = sqrtf(dx * dx + dz * dz);
+        if (!best || distance < best_distance) {
+            best = e;
+            best_distance = distance;
+        }
+    }
+    if (!best) return -999;
+    if (what == 3) return best->x;
+    if (what == 4) return best->y;
+    if (what == 5) return best->z;
+    if (what == 6) return best->kind;
+    if (what == 12) return best->health;
+    if (what == 8) return best->dy;
+    return 0;
+}
+
+EMSCRIPTEN_KEEPALIVE int craft_is_paused() {
+    return g->paused;
+}
+
+EMSCRIPTEN_KEEPALIVE int craft_entity_count() {
+    return entity_count();
+}
+
+// Sends every creature away. The menu uses it for a fresh start, the smoke
+// test to measure against a known state.
+EMSCRIPTEN_KEEPALIVE void craft_clear_mobs() {
+    entities_clear();
+}
+
+// Hands a creature into the world in front of the player. Used by the smoke
+// test, and by anyone who wants to see what they are building.
+EMSCRIPTEN_KEEPALIVE void craft_spawn_mob(int kind) {
+    State *s = &g->players->state;
+    entity_spawn_in_front(kind, s->x, s->y - 1, s->z, s->rx);
+}
+
+EMSCRIPTEN_KEEPALIVE float craft_nearest_mob() {
+    State *s = &g->players->state;
+    float best = -1;
+    for (int i = 0; i < MAX_ENTITIES; i++) {
+        Entity *e = entity_at(i);
+        if (!e->used) {
+            continue;
+        }
+        float dx = e->x - s->x;
+        float dz = e->z - s->z;
+        float distance = sqrtf(dx * dx + dz * dz);
+        if (best < 0 || distance < best) {
+            best = distance;
+        }
+    }
+    return best;
 }
 
 // Hand the finished frame to the browser and continue on the next animation
@@ -3058,6 +3244,9 @@ void reset_model() {
     g->item_index = 0;
     g->dy = 0;
     g->dead = 0;
+    g->paused = 0;
+    g->attack_timer = 0;
+    g->dimension = 0;
     g->hurt_timer = 0;
     g->regen_timer = 0;
     g->health = MAX_HEALTH;
@@ -3209,6 +3398,7 @@ int main(int argc, char **argv) {
     }
 
     inventory_init();
+    entities_init();
 #ifdef __EMSCRIPTEN__
     // onRuntimeInitialized fires before main() runs: at that moment the item
     // registry is still empty, and an interface that reads it then gets
@@ -3339,6 +3529,37 @@ int main(int argc, char **argv) {
 
             // SURVIVAL //
             survival_tick(dt);
+            if (g->attack_timer > 0) {
+                g->attack_timer -= dt;
+            }
+
+            // CREATURES //
+            {
+                float daylight = get_daylight();
+                float damage = entities_update(
+                    dt, s->x, s->y, s->z, g->dimension, daylight, g->paused);
+                if (damage > 0) {
+                    hurt_player(damage);
+                }
+                if (!g->paused) {
+                    entities_maybe_spawn(
+                        dt, s->x, s->y, s->z, g->dimension, daylight);
+                }
+                // bolts that found a creature
+                for (int i = 0; i < MAX_PROJECTILES; i++) {
+                    Projectile *p = projectile_at(i);
+                    if (!p->hit) {
+                        continue;
+                    }
+                    int count = 0;
+                    int drop = entity_damage(p->hit - 1, p->damage, &count);
+                    if (drop && g->game_mode == GAME_SURVIVAL) {
+                        inv_add(drop, count);
+                    }
+                    p->used = 0;
+                    p->hit = 0;
+                }
+            }
 
             // HANDLE DATA FROM SERVER //
             char *buffer = client_recv();
@@ -3399,6 +3620,7 @@ int main(int argc, char **argv) {
             render_signs(&text_attrib, player);
             render_sign(&text_attrib, player);
             render_players(&block_attrib, player);
+            render_entities(&block_attrib, player);
             if (SHOW_WIREFRAME) {
                 render_wireframe(&line_attrib, player);
             }
@@ -3487,6 +3709,7 @@ int main(int argc, char **argv) {
                 render_chunks(&block_attrib, player);
                 render_signs(&text_attrib, player);
                 render_players(&block_attrib, player);
+            render_entities(&block_attrib, player);
                 glClear(GL_DEPTH_BUFFER_BIT);
                 if (SHOW_PLAYER_NAMES) {
                     render_text(&text_attrib, ALIGN_CENTER,
