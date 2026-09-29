@@ -395,6 +395,7 @@ var CraftUI = (function () {
          ['⛏', 'mine the block in the crosshair — or hit the creature in it'],
          ['▣', 'place the block that is in the selected slot'],
          ['Crossbow', 'select it in the hotbar, then ⛏ shoots a bolt'],
+         ['Gateway', 'craft a Portal Stone, place it, light it with the Fire Starter, step in'],
          ['🎒', 'inventory and crafting'],
          ['✈', 'flying, creative mode only'],
          ['Keyboard', 'WASD, space, 1–9, tab']

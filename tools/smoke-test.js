@@ -448,6 +448,126 @@ async function diff(page, a, b) {
         await page.evaluate(() => { Module._craft_toggle_fly(); });
     }
 
+    // ---- the underworld (beta) ----
+    await page.evaluate(() => {
+        Module._craft_respawn();
+        Module._craft_clear_mobs();
+        Module._craft_set_game_mode(0);
+        Module._craft_select_slot(0);
+        Module._craft_inv_give(64, 1);      // portal stone
+        Module._craft_touch_look(0, 420);   // look straight at the ground
+    });
+    await page.waitForTimeout(500);
+    await tap('#break');                    // clear the grass in the way
+    await page.waitForTimeout(300);
+    await tap('#place');                    // set the stone down
+    await page.waitForTimeout(400);
+    await page.evaluate(() => {
+        Module._craft_select_slot(0);
+        Module._craft_inv_give(163, 1);     // fire starter
+    });
+    await page.waitForTimeout(300);
+    await tap('#place');                    // light it
+    await page.waitForTimeout(400);
+
+    if (process.env.VERBOSE) {
+        console.log('    Umgebung:', JSON.stringify(await page.evaluate(() => {
+            const x0 = Math.round(Module._craft_probe(0));
+            const y0 = Math.round(Module._craft_probe(1));
+            const z0 = Math.round(Module._craft_probe(2));
+            const found = [];
+            for (let dx = -5; dx <= 5; dx++)
+                for (let dz = -5; dz <= 5; dz++)
+                    for (let dy = -4; dy <= 3; dy++) {
+                        const w = Module._craft_block_at(x0+dx, y0+dy, z0+dz);
+                        if (w === 64 || w === 65) found.push([w, dx, dy, dz]);
+                    }
+            return { me: [x0, y0, z0], dead: Module._craft_is_dead(),
+                     paused: Module._craft_is_paused(), found: found,
+                     slot: Module._craft_inv_item(Module._craft_hotbar_index()) };
+        })));
+    }
+
+    // walk into it: find the gateway block and stand in it
+    const gate = await page.evaluate(() => {
+        const x0 = Math.round(Module._craft_probe(0));
+        const y0 = Math.round(Module._craft_probe(1));
+        const z0 = Math.round(Module._craft_probe(2));
+        for (let dx = -4; dx <= 4; dx++) {
+            for (let dz = -4; dz <= 4; dz++) {
+                for (let dy = -3; dy <= 2; dy++) {
+                    if (Module._craft_block_at(x0 + dx, y0 + dy, z0 + dz) === 65) {
+                        return [x0 + dx, y0 + dy, z0 + dz];
+                    }
+                }
+            }
+        }
+        return null;
+    });
+    check('phone: the fire starter opens a gateway', gate !== null,
+        gate ? 'gateway at ' + gate : 'no gateway block found');
+    if (gate) {
+        await page.evaluate(([x, y, z]) => Module._craft_teleport(x, y, z), gate);
+    }
+    let travelled = false;
+    for (let i = 0; i < 20 && !travelled; i++) {
+        await page.waitForTimeout(500);
+        travelled = await page.evaluate(() => Module._craft_dimension()) === 1;
+    }
+    check('phone: the gateway leads into the underworld', travelled);
+    if (travelled) {
+        await page.waitForTimeout(4000);    // let the caves build
+        // step out of the gateway, or the picture is one purple block
+        const out = await page.evaluate(() => {
+            const x = Module._craft_probe(0);
+            const y = Module._craft_probe(1);
+            const z = Module._craft_probe(2);
+            Module._craft_teleport(x + 2, y, z);
+            return [x, y, z];
+        });
+        await page.waitForTimeout(1500);
+        check('phone: the world does not bounce the player back and forth',
+            await page.evaluate(() => Module._craft_dimension()) === 1,
+            'still in the underworld after stepping aside');
+        await page.screenshot({ path: OUT + '/shot-09-underworld.png' });
+        const under = await page.evaluate(() => {
+            let rock = 0;
+            let lava = 0;
+            const y0 = Math.round(Module._craft_probe(1));
+            const x0 = Math.round(Module._craft_probe(0));
+            const z0 = Math.round(Module._craft_probe(2));
+            for (let x = x0 - 6; x <= x0 + 6; x++) {
+                for (let z = z0 - 6; z <= z0 + 6; z++) {
+                    for (let y = 4; y < 40; y++) {
+                        const w = Module._craft_block_at(x, y, z);
+                        if (w === 28 || w === 29 || w === 30) rock++;
+                        if (w === 66) lava++;
+                    }
+                }
+            }
+            return { rock: rock, lava: lava, y: y0 };
+        });
+        check('phone: the underworld is made of its own blocks', under.rock > 200,
+            under.rock + ' rock, ' + under.lava + ' lava');
+        check('phone: there is lava down there', under.lava > 0,
+            under.lava + ' blocks');
+
+        // creatures of that world turn up
+        await page.evaluate(() => Module._craft_spawn_mob(8));   // magma brute
+        await page.waitForTimeout(700);
+        check('phone: creatures of the underworld can live there',
+            await page.evaluate(() => Module._craft_entity_count()) >= 1);
+
+        // and the gateway carries the player home again: back into it
+        await page.evaluate(([x, y, z]) => Module._craft_teleport(x, y, z), out);
+        let back = false;
+        for (let i = 0; i < 20 && !back; i++) {
+            await page.waitForTimeout(500);
+            back = await page.evaluate(() => Module._craft_dimension()) === 0;
+        }
+        check('phone: the gateway leads back home', back);
+    }
+
     // the world, the bag and the mode survive a reload
     await page.evaluate(() => Module._craft_save_now());
     await page.waitForTimeout(1500);

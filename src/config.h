@@ -60,6 +60,11 @@
 #define CHUNK_SIZE 32
 // the terrain floor sits at 12, so the sea is two blocks deep
 #define SEA_LEVEL 14
+
+// the underworld
+#define UNDERWORLD_CEILING 56
+#define LAVA_LEVEL 9
+#define UNDERWORLD_DB_PATH "craft_under.db"
 #define COMMIT_INTERVAL 5
 
 #endif

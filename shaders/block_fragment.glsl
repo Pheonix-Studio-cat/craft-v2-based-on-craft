@@ -4,6 +4,7 @@ uniform float timer;
 uniform float daylight;
 uniform int ortho;
 uniform float underwater;    // 1.0 while the camera itself is in a liquid
+uniform float underworld;    // 1.0 while the player is in the other world
 
 varying vec2 fragment_uv;
 varying float fragment_ao;
@@ -36,6 +37,9 @@ void main() {
     color *= fragment_shimmer;
     vec3 sky_color = vec3(texture2D(sky_sampler, vec2(timer, fog_height)));
     color = mix(color, sky_color, fog_factor);
+    if (underworld > 0.5) {
+        color = mix(color, vec3(0.30, 0.09, 0.07), 0.22);
+    }
     if (underwater > 0.5) {
         color = mix(color, vec3(0.08, 0.30, 0.50), 0.45);
     }

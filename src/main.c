@@ -136,6 +136,7 @@ typedef struct {
     GLuint extra4;
     GLuint extra5;
     GLuint extra6;
+    GLuint extra7;
 } Attrib;
 
 typedef struct {
@@ -168,6 +169,8 @@ typedef struct {
     int dimension;       // 0 overworld, 1 underworld
     float air;           // seconds of breath left under water
     int underwater;      // the camera itself is in a liquid
+    float portal_timer;  // seconds before a portal works again
+    int portal_ready;    // the player has left the gateway they arrived in
     int paused;          // a menu is open: creatures wait
     float attack_timer;  // seconds until the next swing is allowed
     int scale;
@@ -1702,7 +1705,7 @@ int render_chunks(Attrib *attrib, Player *player) {
     ensure_chunks(player);
     int p = chunked(s->x);
     int q = chunked(s->z);
-    float light = get_daylight();
+    float light = g->dimension ? 0.55 : get_daylight();
     float matrix[16];
     set_matrix_3d(
         matrix, g->width, g->height,
@@ -1721,6 +1724,7 @@ int render_chunks(Attrib *attrib, Player *player) {
     glUniform1f(attrib->timer, time_of_day());
     glUniform1f(attrib->extra5, glfwGetTime());
     glUniform1f(attrib->extra6, g->underwater ? 1.0 : 0.0);
+    glUniform1f(attrib->extra7, g->dimension ? 1.0 : 0.0);
     for (int i = 0; i < g->chunk_count; i++) {
         Chunk *chunk = g->chunks + i;
         if (chunk_distance(chunk, p, q) > g->render_radius) {
@@ -1865,6 +1869,7 @@ void render_sky(Attrib *attrib, Player *player, GLuint buffer) {
     glUniform1i(attrib->sampler, 2);
     glUniform1f(attrib->timer, time_of_day());
     glUniform1f(attrib->extra1, g->underwater ? 1.0 : 0.0);
+    glUniform1f(attrib->extra2, g->dimension ? 1.0 : 0.0);
     draw_triangles_3d(attrib, buffer, 512 * 3);
 }
 
@@ -2334,6 +2339,94 @@ void flood_water(int x, int y, int z) {
 }
 
 // ---------------------------------------------------------------------------
+// the two worlds
+// ---------------------------------------------------------------------------
+
+// Each dimension keeps its own world file. That way the chunk coordinates
+// stay small (a far-away second world would lose precision in a float) and
+// an old world file keeps working untouched.
+void travel_to_dimension(int dimension) {
+    State *s = &g->players->state;
+    if (dimension == g->dimension) {
+        return;
+    }
+    // take everything that belongs to the player with us
+    db_save_state(s->x, s->y, s->z, s->rx, s->ry);
+    save_player_meta();
+    db_commit();
+    db_close();
+    db_disable();
+
+    g->dimension = dimension ? 1 : 0;
+    world_set_dimension(g->dimension);
+    delete_all_chunks();
+    entities_clear();
+
+    snprintf(g->db_path, MAX_PATH_LENGTH, "%s",
+        g->dimension ? UNDERWORLD_DB_PATH : DB_PATH);
+    db_enable();
+    if (db_init(g->db_path)) {
+        return;
+    }
+    save_player_meta();
+
+    float x, y, z, rx, ry;
+    if (db_load_state(&x, &y, &z, &rx, &ry)) {
+        s->x = x;
+        s->y = y;
+        s->z = z;
+        s->rx = rx;
+        s->ry = ry;
+    }
+    else if (g->dimension == 1) {
+        // arriving for the first time: keep x and z, drop in under the roof
+        s->y = UNDERWORLD_CEILING - 4;
+    }
+    g->dy = 0;
+    g->portal_timer = 1;
+    g->portal_ready = 0;           // step out of the gateway before it works
+    force_chunks(g->players);
+
+    // a way home, right where we land
+    int px = roundf(s->x);
+    int py = roundf(s->y) - 1;
+    int pz = roundf(s->z);
+    for (int dy = -1; dy <= 2; dy++) {
+        if (is_obstacle(get_block(px, py + dy, pz))) {
+            set_block(px, py + dy, pz, EMPTY);
+        }
+    }
+    set_block(px, py - 1, pz, PORTAL_STONE);
+    set_block(px, py, pz, PORTAL);
+    s->y = py + 1;
+    add_message(g->dimension
+        ? "The underworld (beta). The gateway behind you leads home."
+        : "Home again.");
+}
+
+// The fire starter opens a gateway on a portal stone. No frame to build:
+// stacking four blocks correctly is no fun with a thumb.
+int light_portal() {
+    State *s = &g->players->state;
+    ItemType *type = held_type();
+    if (!type || type->id != ITEM_FIRE_STARTER) {
+        return 0;
+    }
+    int hx, hy, hz;
+    int hw = hit_test(0, s->x, s->y, s->z, s->rx, s->ry, &hx, &hy, &hz);
+    if (hw != PORTAL_STONE) {
+        return 0;
+    }
+    if (get_block(hx, hy + 1, hz) != EMPTY) {
+        add_message("The gateway needs room above the stone.");
+        return 1;
+    }
+    set_block(hx, hy + 1, hz, PORTAL);
+    add_message("A gateway opens. Step into it.");
+    return 1;
+}
+
+// ---------------------------------------------------------------------------
 // survival
 // ---------------------------------------------------------------------------
 
@@ -2403,6 +2496,22 @@ void survival_tick(double dt) {
     int head = block_at_player(0);
     g->underwater = is_liquid(head);
 
+    // A gateway carries the player over -- but only once per entry. Whoever
+    // arrives is standing in the gateway they came out of; without this they
+    // would bounce between the worlds for ever.
+    if (g->portal_timer > 0) {
+        g->portal_timer -= dt;
+    }
+    int in_portal = head == PORTAL || block_at_player(-1) == PORTAL;
+    if (!in_portal) {
+        g->portal_ready = 1;
+    }
+    else if (g->portal_ready && g->portal_timer <= 0) {
+        g->portal_ready = 0;
+        travel_to_dimension(g->dimension ? 0 : 1);
+        return;
+    }
+
     if (g->game_mode != GAME_SURVIVAL) {
         g->health = MAX_HEALTH;
         g->air = MAX_AIR;
@@ -2459,6 +2568,8 @@ void save_player_meta() {
     db_set_meta("health", buffer);
     snprintf(buffer, sizeof(buffer), "%d", g->game_mode);
     db_set_meta("mode", buffer);
+    snprintf(buffer, sizeof(buffer), "%d", g->dimension);
+    db_set_meta("dimension", buffer);
 }
 
 void use_held_item() {
@@ -2558,8 +2669,11 @@ void on_right_click() {
         return;
     }
     if (!type->block) {
-        // nothing to place: eat it, or swing it (weapons are handled by the
-        // attack button)
+        // nothing to place: light a gateway, eat it, or swing it (weapons
+        // are handled by the attack button)
+        if (light_portal()) {
+            return;
+        }
         use_held_item();
         return;
     }
@@ -3013,6 +3127,10 @@ EMSCRIPTEN_KEEPALIVE void craft_teleport(float x, float y, float z) {
     g->dy = 0;
 }
 
+EMSCRIPTEN_KEEPALIVE int craft_dimension() {
+    return g->dimension;
+}
+
 EMSCRIPTEN_KEEPALIVE int craft_is_paused() {
     return g->paused;
 }
@@ -3378,6 +3496,8 @@ void reset_model() {
     g->dead = 0;
     g->air = MAX_AIR;
     g->underwater = 0;
+    g->portal_timer = 0;
+    g->portal_ready = 1;
     g->paused = 0;
     g->attack_timer = 0;
     g->dimension = 0;
@@ -3494,6 +3614,7 @@ int main(int argc, char **argv) {
     block_attrib.timer = glGetUniformLocation(program, "timer");
     block_attrib.extra5 = glGetUniformLocation(program, "wave");
     block_attrib.extra6 = glGetUniformLocation(program, "underwater");
+    block_attrib.extra7 = glGetUniformLocation(program, "underworld");
 
     program = load_program(
         "shaders/line_vertex.glsl", "shaders/line_fragment.glsl");
@@ -3520,6 +3641,7 @@ int main(int argc, char **argv) {
     sky_attrib.sampler = glGetUniformLocation(program, "sampler");
     sky_attrib.timer = glGetUniformLocation(program, "timer");
     sky_attrib.extra1 = glGetUniformLocation(program, "underwater");
+    sky_attrib.extra2 = glGetUniformLocation(program, "underworld");
 
     // CHECK COMMAND LINE ARGUMENTS //
     if (argc == 2 || argc == 3) {
@@ -3628,6 +3750,10 @@ int main(int argc, char **argv) {
         }
         else {
             inv_give_starting_items(g->game_mode);
+        }
+        if (db_get_meta("dimension", meta, sizeof(meta)) && atoi(meta) == 1) {
+            // the player logged out down there
+            travel_to_dimension(1);
         }
         if (db_get_meta("health", meta, sizeof(meta))) {
             g->health = atof(meta);
