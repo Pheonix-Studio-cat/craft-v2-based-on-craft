@@ -101,6 +101,15 @@ void make_plant(
     float *data, float ao, float light,
     float px, float py, float pz, float n, int w, float rotation)
 {
+    make_sprite(data, ao, light, px, py, pz, n, plants[w], rotation);
+}
+
+// The same two crossed quads a plant is made of, but with the atlas tile
+// given directly -- that is how a tool or a weapon is drawn in the hand.
+void make_sprite(
+    float *data, float ao, float light,
+    float px, float py, float pz, float n, int tile, float rotation)
+{
     static const float positions[4][4][3] = {
         {{ 0, -1, -1}, { 0, -1, +1}, { 0, +1, -1}, { 0, +1, +1}},
         {{ 0, -1, -1}, { 0, -1, +1}, { 0, +1, -1}, { 0, +1, +1}},
@@ -129,8 +138,8 @@ void make_plant(
     float s = 0.0625;
     float a = 0;
     float b = s;
-    float du = (plants[w] % 16) * s;
-    float dv = (plants[w] / 16) * s;
+    float du = (tile % 16) * s;
+    float dv = (tile / 16) * s;
     for (int i = 0; i < 4; i++) {
         for (int v = 0; v < 6; v++) {
             int j = indices[i][v];

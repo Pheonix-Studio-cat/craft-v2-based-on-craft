@@ -1,0 +1,303 @@
+/* Smoke test for the browser build.
+ *
+ * Not run by CI -- it needs Playwright and a Chromium. Run it after touching
+ * anything in src/ or web/:
+ *
+ *     ./web/build.sh
+ *     NODE_PATH=/opt/node22/lib/node_modules node tools/smoke-test.js
+ *
+ * Two browser contexts, because one cannot cover both honestly:
+ *   phone   -- taps and a held stick, sent as real touch events over CDP.
+ *              Chromium drops the coordinates of touchMove, so no drags here.
+ *   desktop -- a real mouse drag, the same pointer path a finger takes when
+ *              looking around.
+ *
+ * Every pixel measurement has a control: the same measurement while nothing
+ * happens. Without it "the picture changed" proves nothing -- the frame rate
+ * counter in the HUD changes every frame.
+ */
+const { chromium } = require('playwright');
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
+
+const ROOT = path.join(__dirname, '..', 'build', 'web');
+const PORT = 8099;
+const OUT = process.env.SHOT_DIR || '/tmp';
+const TYPES = {
+    '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css',
+    '.wasm': 'application/wasm', '.png': 'image/png',
+    '.data': 'application/octet-stream'
+};
+
+let failures = 0;
+function check(name, ok, detail) {
+    console.log((ok ? 'PASS ' : 'FAIL ') + name + (detail ? ' — ' + detail : ''));
+    if (!ok) failures++;
+}
+
+const server = http.createServer((req, res) => {
+    const file = path.join(ROOT, req.url === '/' ? 'index.html' : req.url.split('?')[0]);
+    fs.readFile(file, (err, data) => {
+        if (err) { res.writeHead(404); return res.end('no'); }
+        res.writeHead(200, { 'Content-Type': TYPES[path.extname(file)] || 'text/plain' });
+        res.end(data);
+    });
+});
+
+async function diff(page, a, b) {
+    return page.evaluate(async ([a, b]) => {
+        async function pixels(data) {
+            const img = new Image();
+            img.src = 'data:image/png;base64,' + data;
+            await img.decode();
+            const c = new OffscreenCanvas(img.width, img.height);
+            const g = c.getContext('2d');
+            g.drawImage(img, 0, 0);
+            return g.getImageData(0, 0, img.width, img.height).data;
+        }
+        const [p, q] = [await pixels(a), await pixels(b)];
+        let sum = 0;
+        for (let i = 0; i < p.length; i += 4) {
+            sum += Math.abs(p[i] - q[i]) + Math.abs(p[i + 1] - q[i + 1]) +
+                   Math.abs(p[i + 2] - q[i + 2]);
+        }
+        return sum / (p.length / 4 * 3);
+    }, [a, b]);
+}
+
+(async () => {
+    await new Promise(r => server.listen(PORT, r));
+    const browser = await chromium.launch({
+        executablePath: process.env.CHROMIUM ||
+            '/opt/pw-browsers/chromium-1194/chrome-linux/chrome',
+        args: ['--use-gl=swiftshader', '--enable-unsafe-swiftshader', '--no-sandbox'],
+    });
+
+    // ===================== phone =====================
+    const phone = await browser.newContext({
+        viewport: { width: 390, height: 844 },
+        deviceScaleFactor: 2, isMobile: true, hasTouch: true,
+    });
+    const page = await phone.newPage();
+    const cdp = await phone.newCDPSession(page);
+    const errors = [];
+    page.on('pageerror', e => errors.push('pageerror: ' + e.message));
+    page.on('console', m => { if (m.type() === 'error') errors.push('console: ' + m.text()); });
+
+    const touchStart = (x, y) => cdp.send('Input.dispatchTouchEvent',
+        { type: 'touchStart', touchPoints: [{ x, y }] });
+    const touchEnd = () => cdp.send('Input.dispatchTouchEvent',
+        { type: 'touchEnd', touchPoints: [] });
+    async function tap(selector, index) {
+        const box = await (index === undefined
+            ? page.locator(selector)
+            : page.locator(selector).nth(index)).boundingBox();
+        await touchStart(box.x + box.width / 2, box.y + box.height / 2);
+        await touchEnd();
+        await page.waitForTimeout(150);
+    }
+    const clip = { x: 40, y: 190, width: 310, height: 330 };
+    const shot = async () => (await page.screenshot({ clip })).toString('base64');
+    const state = () => page.evaluate(() => ({
+        mode: Module._craft_game_mode(),
+        health: Module._craft_health(),
+        dead: Module._craft_is_dead(),
+        hotbar: Array.from({ length: 9 }, (_, i) =>
+            [Module._craft_inv_item(i), Module._craft_inv_count(i)]),
+        bag: Array.from({ length: 36 }, (_, i) =>
+            [Module._craft_inv_item(i), Module._craft_inv_count(i)])
+            .filter(s => s[1] > 0),
+    }));
+
+    await page.goto(`http://127.0.0.1:${PORT}/`);
+    let started = true;
+    try { await page.waitForSelector('#controls:not(.hidden)', { timeout: 120000 }); }
+    catch (e) { started = false; }
+    check('phone: module starts and the controls appear', started);
+    if (!started) { console.log(errors.join('\n')); await browser.close(); server.close(); process.exit(1); }
+
+    // the help panel shows up on a first visit
+    check('phone: the help panel opens on a first visit',
+        await page.locator('#modal:not(.hidden)').count() === 1);
+    await tap('#panel button.primary');     // "Back" on the help panel
+    await tap('#panel button.primary');     // "Continue" on the menu
+    await page.waitForTimeout(6000);       // let the world generate
+
+    check('phone: the menu is closed again',
+        await page.locator('#modal.hidden').count() === 1);
+
+    // hotbar
+    const filled = (await state()).hotbar.filter(s => s[1] > 0).length;
+    check('phone: the hotbar is filled in creative mode', filled === 9, filled + ' of 9 slots');
+
+    await page.screenshot({ path: OUT + '/shot-01-start.png' });
+
+    // standing still barely changes the picture -- this is the control
+    const idle1 = await shot();
+    await page.waitForTimeout(2200);
+    const idle2 = await shot();
+    const idleDiff = await diff(page, idle1, idle2);
+
+    // the stick walks
+    const stick = await page.locator('#stick').boundingBox();
+    await touchStart(stick.x + stick.width / 2, stick.y + stick.height / 2 - 40);
+    await page.waitForTimeout(2200);
+    await touchEnd();
+    await page.waitForTimeout(400);
+    const walkDiff = await diff(page, idle2, await shot());
+    check('phone: the stick walks the player',
+        walkDiff > idleDiff * 3 && walkDiff > 2,
+        'walking ' + walkDiff.toFixed(2) + ' vs standing ' + idleDiff.toFixed(2));
+
+    // aim at the ground, then build and mine
+    await page.evaluate(() => Module._craft_touch_look(0, 260));
+    await page.waitForTimeout(500);
+    const beforePlace = await shot();
+    await tap('#place');
+    await page.waitForTimeout(600);
+    const placed = await shot();
+    check('phone: PLACE changes the world',
+        await diff(page, beforePlace, placed) > 1);
+    await tap('#break');
+    await page.waitForTimeout(600);
+    check('phone: BREAK changes the world',
+        await diff(page, placed, await shot()) > 1);
+
+    // survival mode through the menu
+    await tap('#menu-button');
+    await tap('#panel .choice', 1);        // Survival
+    await page.waitForTimeout(200);
+    check('phone: the menu switches to survival', (await state()).mode === 1);
+    check('phone: hearts appear in survival',
+        await page.locator('#hearts .heart').count() === 10);
+    check('phone: the fly button is hidden in survival',
+        await page.locator('#fly.hidden').count() === 1);
+    await tap('#panel button.primary');     // Continue
+    await page.waitForTimeout(300);
+
+    // mining fills the bag
+    const bagBefore = (await state()).bag.length;
+    await page.evaluate(() => Module._craft_touch_look(0, 120));
+    await page.waitForTimeout(300);
+    for (let i = 0; i < 4; i++) { await tap('#break'); await page.waitForTimeout(250); }
+    const bagAfter = (await state()).bag;
+    check('phone: mining in survival fills the bag',
+        bagAfter.length > bagBefore || bagAfter.some(s => s[1] > 1),
+        JSON.stringify(bagAfter));
+
+    // crafting: wood from the creative palette, planks out of the recipe list
+    await page.evaluate(() => {
+        Module._craft_set_game_mode(0);
+        Module._craft_inv_give(5, 4);          // 5 = WOOD
+        Module._craft_set_game_mode(1);
+    });
+    await tap('#bag');
+    await tap('.tabs button', 1);              // "Craft"
+    const recipeCount = await page.locator('.recipe').count();
+    check('phone: the crafting list is there', recipeCount > 8, recipeCount + ' recipes');
+    const enabled = await page.locator('.recipe:not([disabled])').count();
+    check('phone: a recipe with the ingredients at hand is enabled', enabled >= 1,
+        enabled + ' of ' + recipeCount);
+    await tap('.recipe:not([disabled])');
+    const afterCraft = (await state()).bag;
+    check('phone: crafting produces the item',
+        afterCraft.some(s => s[0] === 8),      // 8 = PLANK
+        JSON.stringify(afterCraft));
+    await page.screenshot({ path: OUT + '/shot-02-crafting.png' });
+    await tap('#panel button.primary');        // back to the game
+
+    // falling hurts, and enough of it kills
+    await page.evaluate(() => {
+        Module._craft_set_game_mode(0);
+        Module._craft_toggle_fly();
+    });
+    await touchStart(0, 0);                    // nothing, just to settle input
+    await touchEnd();
+    await page.evaluate(() => Module._craft_touch_jump(1));
+    await page.waitForTimeout(2500);           // fly up
+    await page.evaluate(() => {
+        Module._craft_touch_jump(0);
+        Module._craft_set_game_mode(1);        // survival turns flying off
+    });
+    await page.waitForTimeout(4000);           // fall
+    const afterFall = await state();
+    check('phone: falling costs health', afterFall.health < 20 || afterFall.dead,
+        'health ' + afterFall.health + (afterFall.dead ? ', dead' : ''));
+
+    // death screen, if the fall was deep enough
+    if (afterFall.dead) {
+        await page.waitForTimeout(400);
+        check('phone: the death screen appears',
+            (await page.locator('#panel h1').textContent()).indexOf('died') >= 0);
+        await tap('#panel button.primary');
+        check('phone: respawn brings the player back', (await state()).dead === 0);
+    }
+
+    // the world, the bag and the mode survive a reload
+    await page.evaluate(() => Module._craft_save_now());
+    await page.waitForTimeout(1500);
+    const before = await state();
+    const beforeReload = errors.length;
+    await page.reload();
+    await page.waitForSelector('#controls:not(.hidden)', { timeout: 120000 });
+    await page.waitForTimeout(4000);
+    const after = await state();
+    check('phone: the game mode survives a reload', after.mode === before.mode);
+    check('phone: the bag survives a reload',
+        JSON.stringify(after.bag) === JSON.stringify(before.bag),
+        JSON.stringify(after.bag));
+    check('phone: no errors after the reload', errors.length === beforeReload,
+        errors.slice(beforeReload).join(' | '));
+    await page.screenshot({ path: OUT + '/shot-03-reloaded.png' });
+    check('phone: no javascript or wasm errors at all', errors.length === 0,
+        errors.join(' | '));
+
+    // ===================== desktop =====================
+    const desktop = await browser.newContext({ viewport: { width: 900, height: 600 } });
+    const big = await desktop.newPage();
+    const deskErrors = [];
+    big.on('pageerror', e => deskErrors.push('pageerror: ' + e.message));
+    big.on('console', m => { if (m.type() === 'error') deskErrors.push('console: ' + m.text()); });
+    await big.goto(`http://127.0.0.1:${PORT}/`);
+    await big.waitForSelector('#controls:not(.hidden)', { timeout: 120000 });
+    await big.waitForTimeout(6000);
+    if (await big.locator('#modal:not(.hidden)').count()) {
+        await big.click('#panel button');
+        if (await big.locator('#modal:not(.hidden)').count()) {
+            await big.click('#panel button');
+        }
+    }
+
+    const deskClip = { x: 150, y: 100, width: 600, height: 400 };
+    const deskShot = async () => (await big.screenshot({ clip: deskClip })).toString('base64');
+    const deskBefore = await deskShot();
+    await big.waitForTimeout(1500);
+    const deskIdle = await diff(big, deskBefore, await deskShot());
+
+    await big.mouse.move(450, 300);
+    await big.mouse.down();
+    await big.mouse.move(450, 420, { steps: 10 });
+    await big.mouse.up();
+    await big.waitForTimeout(800);
+    const lookDiff = await diff(big, deskBefore, await deskShot());
+    check('desktop: dragging looks around',
+        lookDiff > deskIdle * 5 && lookDiff > 4,
+        'drag ' + lookDiff.toFixed(2) + ' vs still ' + deskIdle.toFixed(2));
+    await big.screenshot({ path: OUT + '/shot-04-desktop.png' });
+
+    const keysBefore = await deskShot();
+    await big.keyboard.down('w');
+    await big.waitForTimeout(1800);
+    await big.keyboard.up('w');
+    await big.waitForTimeout(400);
+    check('desktop: the W key walks',
+        await diff(big, keysBefore, await deskShot()) > 2);
+    check('desktop: no javascript or wasm errors', deskErrors.length === 0,
+        deskErrors.join(' | '));
+
+    await browser.close();
+    server.close();
+    console.log(failures ? failures + ' check(s) failed' : 'all checks passed');
+    process.exit(failures ? 1 : 0);
+})();

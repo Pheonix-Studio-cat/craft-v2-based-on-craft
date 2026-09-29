@@ -18,6 +18,7 @@
 #include "config.h"
 #include "cube.h"
 #include "db.h"
+#include "inventory.h"
 #include "item.h"
 #include "map.h"
 #include "matrix.h"
@@ -47,6 +48,12 @@
 
 #define MODE_OFFLINE 0
 #define MODE_ONLINE 1
+
+// how the world is played, not how it is connected
+#define GAME_CREATIVE 0
+#define GAME_SURVIVAL 1
+
+#define MAX_HEALTH 20
 
 #define WORKER_IDLE 0
 #define WORKER_BUSY 1
@@ -148,7 +155,13 @@ typedef struct {
     int observe1;
     int observe2;
     int flying;
-    int item_index;
+    int item_index;      // the selected hotbar slot, 0 .. HOTBAR_SIZE - 1
+    int game_mode;       // GAME_CREATIVE or GAME_SURVIVAL
+    float health;        // 0 .. MAX_HEALTH, only counted in survival
+    float hurt_timer;    // seconds left before health starts coming back
+    float regen_timer;
+    float dy;            // vertical speed, kept here for the fall damage
+    int dead;
     int scale;
     int ortho;
     float fov;
@@ -168,6 +181,13 @@ typedef struct {
 
 static Model model;
 static Model *g = &model;
+
+// Used before they are defined, the way upstream's main.c does it for
+// nothing at all -- these four are the exception.
+int held_item();
+ItemType *held_type();
+void hurt_player(float amount);
+void save_player_meta();
 
 int chunked(float x) {
     return floorf(roundf(x) / CHUNK_SIZE);
@@ -297,6 +317,14 @@ GLuint gen_plant_buffer(float x, float y, float z, float n, int w) {
     float ao = 0;
     float light = 1;
     make_plant(data, ao, light, x, y, z, n, w, 45);
+    return gen_faces(10, 4, data);
+}
+
+GLuint gen_sprite_buffer(float x, float y, float z, float n, int tile) {
+    GLfloat *data = malloc_faces(10, 4);
+    float ao = 0;
+    float light = 1;
+    make_sprite(data, ao, light, x, y, z, n, tile, 45);
     return gen_faces(10, 4, data);
 }
 
@@ -1814,15 +1842,25 @@ void render_item(Attrib *attrib) {
     glUniform3f(attrib->camera, 0, 0, 5);
     glUniform1i(attrib->sampler, 0);
     glUniform1f(attrib->timer, time_of_day());
-    int w = items[g->item_index];
-    if (is_plant(w)) {
+    ItemType *type = held_type();
+    if (!type) {
+        return;
+    }
+    int w = type->block;
+    if (w && is_plant(w)) {
         GLuint buffer = gen_plant_buffer(0, 0, 0, 0.5, w);
         draw_plant(attrib, buffer);
         del_buffer(buffer);
     }
-    else {
+    else if (w) {
         GLuint buffer = gen_cube_buffer(0, 0, 0, 0.5, w);
         draw_cube(attrib, buffer);
+        del_buffer(buffer);
+    }
+    else {
+        // a tool or a weapon: the flat sprite of its own icon
+        GLuint buffer = gen_sprite_buffer(0, 0, 0, 0.55, type->tile);
+        draw_plant(attrib, buffer);
         del_buffer(buffer);
     }
 }
@@ -2170,6 +2208,111 @@ void parse_command(const char *buffer, int forward) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// survival
+// ---------------------------------------------------------------------------
+
+int held_item() {
+    Slot *slot = inv_slot(g->item_index);
+    return slot ? slot->item : 0;
+}
+
+ItemType *held_type() {
+    return item_type(held_item());
+}
+
+void hurt_player(float amount) {
+    if (g->game_mode != GAME_SURVIVAL || g->dead || amount <= 0) {
+        return;
+    }
+    g->health -= amount;
+    g->hurt_timer = 6;
+    g->regen_timer = 0;
+    if (g->health <= 0) {
+        g->health = 0;
+        g->dead = 1;
+    }
+}
+
+void heal_player(float amount) {
+    g->health += amount;
+    if (g->health > MAX_HEALTH) {
+        g->health = MAX_HEALTH;
+    }
+}
+
+void respawn_player() {
+    State *s = &g->players->state;
+    s->x = 0;
+    s->z = 0;
+    s->y = highest_block(s->x, s->z) + 2;
+    s->rx = 0;
+    s->ry = 0;
+    g->dy = 0;
+    g->health = MAX_HEALTH;
+    g->hurt_timer = 0;
+    g->regen_timer = 0;
+    g->dead = 0;
+}
+
+void set_game_mode(int mode) {
+    g->game_mode = mode ? GAME_SURVIVAL : GAME_CREATIVE;
+    if (g->game_mode == GAME_SURVIVAL) {
+        g->flying = 0;
+        if (g->health <= 0) {
+            g->health = MAX_HEALTH;
+            g->dead = 0;
+        }
+    }
+    else {
+        g->health = MAX_HEALTH;
+        g->dead = 0;
+    }
+}
+
+// Health comes back on its own once nothing has hurt the player for a while.
+// No hunger bar: on a touch screen one more thing to watch is one too many.
+void survival_tick(double dt) {
+    if (g->game_mode != GAME_SURVIVAL) {
+        g->health = MAX_HEALTH;
+        g->dead = 0;
+        return;
+    }
+    if (g->dead) {
+        return;
+    }
+    if (g->hurt_timer > 0) {
+        g->hurt_timer -= dt;
+    }
+    else if (g->health < MAX_HEALTH) {
+        g->regen_timer += dt;
+        if (g->regen_timer >= 4) {
+            g->regen_timer = 0;
+            heal_player(1);
+        }
+    }
+}
+
+void save_player_meta() {
+    char buffer[32];
+    db_set_meta("inventory", inventory_save_string());
+    snprintf(buffer, sizeof(buffer), "%d", (int)g->health);
+    db_set_meta("health", buffer);
+    snprintf(buffer, sizeof(buffer), "%d", g->game_mode);
+    db_set_meta("mode", buffer);
+}
+
+void use_held_item() {
+    ItemType *type = held_type();
+    if (!type) {
+        return;
+    }
+    if (type->kind == KIND_FOOD && g->health < MAX_HEALTH) {
+        heal_player(type->heal);
+        inv_remove_at(g->item_index, 1);
+    }
+}
+
 void on_light() {
     State *s = &g->players->state;
     int hx, hy, hz;
@@ -2181,6 +2324,9 @@ void on_light() {
 
 void on_left_click() {
     State *s = &g->players->state;
+    if (g->dead) {
+        return;
+    }
     int hx, hy, hz;
     int hw = hit_test(0, s->x, s->y, s->z, s->rx, s->ry, &hx, &hy, &hz);
     if (hy > 0 && hy < 256 && is_destructable(hw)) {
@@ -2189,30 +2335,68 @@ void on_left_click() {
         if (is_plant(get_block(hx, hy + 1, hz))) {
             set_block(hx, hy + 1, hz, 0);
         }
+        // In survival the block goes into the bag; in creative it is gone,
+        // because there the bag is bottomless anyway.
+        if (g->game_mode == GAME_SURVIVAL) {
+            int drop = block_drop(hw);
+            if (drop) {
+                inv_add(drop, 1);
+            }
+        }
     }
 }
 
 void on_right_click() {
     State *s = &g->players->state;
+    if (g->dead) {
+        return;
+    }
+    ItemType *type = held_type();
+    if (!type) {
+        return;
+    }
+    if (!type->block) {
+        // nothing to place: eat it, or swing it (weapons are handled by the
+        // attack button)
+        use_held_item();
+        return;
+    }
     int hx, hy, hz;
     int hw = hit_test(1, s->x, s->y, s->z, s->rx, s->ry, &hx, &hy, &hz);
     if (hy > 0 && hy < 256 && is_obstacle(hw)) {
         if (!player_intersects_block(2, s->x, s->y, s->z, hx, hy, hz)) {
-            set_block(hx, hy, hz, items[g->item_index]);
-            record_block(hx, hy, hz, items[g->item_index]);
+            set_block(hx, hy, hz, type->block);
+            record_block(hx, hy, hz, type->block);
+            if (g->game_mode == GAME_SURVIVAL) {
+                inv_remove_at(g->item_index, 1);
+            }
         }
     }
 }
 
+// Pick the block that is in the crosshair. In creative it appears in the
+// hand, in survival it only selects a slot that already holds it.
 void on_middle_click() {
     State *s = &g->players->state;
     int hx, hy, hz;
     int hw = hit_test(0, s->x, s->y, s->z, s->rx, s->ry, &hx, &hy, &hz);
-    for (int i = 0; i < item_count; i++) {
-        if (items[i] == hw) {
-            g->item_index = i;
-            break;
+    if (!hw) {
+        return;
+    }
+    for (int i = 0; i < INVENTORY_SIZE; i++) {
+        Slot *slot = inv_slot(i);
+        if (slot->item == hw && slot->count) {
+            if (i < HOTBAR_SIZE) {
+                g->item_index = i;
+            }
+            else {
+                inv_move(i, g->item_index);
+            }
+            return;
         }
+    }
+    if (g->game_mode == GAME_CREATIVE && item_type(hw)) {
+        inv_set_slot(g->item_index, hw, 1);
     }
 }
 
@@ -2289,22 +2473,19 @@ void on_key(GLFWwindow *window, int key, int scancode, int action, int mods) {
         }
     }
     if (!g->typing) {
-        if (key == CRAFT_KEY_FLY) {
+        if (key == CRAFT_KEY_FLY && g->game_mode == GAME_CREATIVE) {
             g->flying = !g->flying;
         }
         if (key >= '1' && key <= '9') {
             g->item_index = key - '1';
         }
-        if (key == '0') {
-            g->item_index = 9;
-        }
         if (key == CRAFT_KEY_ITEM_NEXT) {
-            g->item_index = (g->item_index + 1) % item_count;
+            g->item_index = (g->item_index + 1) % HOTBAR_SIZE;
         }
         if (key == CRAFT_KEY_ITEM_PREV) {
             g->item_index--;
             if (g->item_index < 0) {
-                g->item_index = item_count - 1;
+                g->item_index = HOTBAR_SIZE - 1;
             }
         }
         if (key == CRAFT_KEY_OBSERVE) {
@@ -2353,13 +2534,13 @@ void on_scroll(GLFWwindow *window, double xdelta, double ydelta) {
     static double ypos = 0;
     ypos += ydelta;
     if (ypos < -SCROLL_THRESHOLD) {
-        g->item_index = (g->item_index + 1) % item_count;
+        g->item_index = (g->item_index + 1) % HOTBAR_SIZE;
         ypos = 0;
     }
     if (ypos > SCROLL_THRESHOLD) {
         g->item_index--;
         if (g->item_index < 0) {
-            g->item_index = item_count - 1;
+            g->item_index = HOTBAR_SIZE - 1;
         }
         ypos = 0;
     }
@@ -2417,6 +2598,8 @@ void on_mouse_button(GLFWwindow *window, int button, int action, int mods) {
 // where the desktop build reads mouse and keyboard.
 // ---------------------------------------------------------------------------
 
+static int web_save_requested = 0;
+
 typedef struct {
     float move_x;      // strafe, -1 (left) .. 1 (right)
     float move_z;      // walk, -1 (forward) .. 1 (backward)
@@ -2444,6 +2627,9 @@ EMSCRIPTEN_KEEPALIVE void craft_touch_jump(int down) {
 }
 
 EMSCRIPTEN_KEEPALIVE void craft_toggle_fly() {
+    if (g->game_mode == GAME_SURVIVAL) {
+        return;
+    }
     g->flying = !g->flying;
 }
 
@@ -2464,14 +2650,99 @@ EMSCRIPTEN_KEEPALIVE void craft_pick_block() {
 }
 
 EMSCRIPTEN_KEEPALIVE void craft_cycle_item(int direction) {
-    g->item_index = (g->item_index + direction) % item_count;
+    g->item_index = (g->item_index + direction) % HOTBAR_SIZE;
     if (g->item_index < 0) {
-        g->item_index += item_count;
+        g->item_index += HOTBAR_SIZE;
     }
 }
 
 EMSCRIPTEN_KEEPALIVE void craft_resize(int width, int height) {
     emscripten_set_canvas_element_size("#canvas", width, height);
+}
+
+// --- survival, inventory and crafting, read by web/ui.js -------------------
+
+EMSCRIPTEN_KEEPALIVE int craft_game_mode() {
+    return g->game_mode;
+}
+
+EMSCRIPTEN_KEEPALIVE void craft_set_game_mode(int mode) {
+    set_game_mode(mode);
+}
+
+EMSCRIPTEN_KEEPALIVE int craft_health() {
+    return (int)ceilf(g->health);
+}
+
+EMSCRIPTEN_KEEPALIVE int craft_max_health() {
+    return MAX_HEALTH;
+}
+
+EMSCRIPTEN_KEEPALIVE int craft_is_dead() {
+    return g->dead;
+}
+
+EMSCRIPTEN_KEEPALIVE void craft_respawn() {
+    respawn_player();
+}
+
+EMSCRIPTEN_KEEPALIVE int craft_inv_version() {
+    return inv_version();
+}
+
+EMSCRIPTEN_KEEPALIVE int craft_inv_item(int index) {
+    Slot *slot = inv_slot(index);
+    return slot ? slot->item : 0;
+}
+
+EMSCRIPTEN_KEEPALIVE int craft_inv_count(int index) {
+    Slot *slot = inv_slot(index);
+    return slot ? slot->count : 0;
+}
+
+EMSCRIPTEN_KEEPALIVE int craft_hotbar_index() {
+    return g->item_index;
+}
+
+EMSCRIPTEN_KEEPALIVE void craft_select_slot(int index) {
+    if (index >= 0 && index < HOTBAR_SIZE) {
+        g->item_index = index;
+    }
+}
+
+EMSCRIPTEN_KEEPALIVE void craft_inv_move(int from, int to) {
+    inv_move(from, to);
+}
+
+EMSCRIPTEN_KEEPALIVE void craft_inv_drop(int index) {
+    inv_remove_at(index, 64);
+}
+
+// The creative palette hands out blocks; survival has to find them.
+EMSCRIPTEN_KEEPALIVE void craft_inv_give(int item, int count) {
+    if (g->game_mode == GAME_CREATIVE) {
+        inv_set_slot(g->item_index, item, count);
+    }
+}
+
+EMSCRIPTEN_KEEPALIVE const char *craft_items_json() {
+    return items_json();
+}
+
+EMSCRIPTEN_KEEPALIVE const char *craft_recipes_json() {
+    return recipes_json();
+}
+
+EMSCRIPTEN_KEEPALIVE int craft_can_craft(int index) {
+    return recipe_can_craft(index);
+}
+
+EMSCRIPTEN_KEEPALIVE int craft_do_craft(int index) {
+    return recipe_craft(index);
+}
+
+EMSCRIPTEN_KEEPALIVE void craft_use_item() {
+    use_held_item();
 }
 
 // Hand the finished frame to the browser and continue on the next animation
@@ -2495,6 +2766,17 @@ EM_JS(void, web_save_world, (), {
         }
     });
 });
+
+// Saving is only *asked for* here, never done here.
+//
+// The main loop sleeps inside asyncify between two frames. An export called
+// from a JavaScript handler that starts asynchronous work -- FS.syncfs does,
+// through IndexedDB -- overwrites the stack asyncify saved for the loop, and
+// the next frame dies with "memory access out of bounds". So the flag is set
+// here and the loop does the work on its own turn.
+EMSCRIPTEN_KEEPALIVE void craft_save_now() {
+    web_save_requested = 1;
+}
 
 #endif
 
@@ -2582,10 +2864,13 @@ void handle_mouse_input() {
 }
 
 void handle_movement(double dt) {
-    static float dy = 0;
     State *s = &g->players->state;
     int sz = 0;
     int sx = 0;
+    if (g->dead) {
+        // no walking away from being dead -- the screen asks to respawn
+        return;
+    }
     if (!g->typing) {
         float m = dt * 1.0;
         g->ortho = glfwGetKey(g->window, CRAFT_KEY_ORTHO) ? 64 : 0;
@@ -2616,8 +2901,8 @@ void handle_movement(double dt) {
             if (g->flying) {
                 vy = 1;
             }
-            else if (dy == 0) {
-                dy = 8;
+            else if (g->dy == 0) {
+                g->dy = 8;
             }
         }
     }
@@ -2630,7 +2915,7 @@ void handle_movement(double dt) {
 #endif
     int estimate = roundf(sqrtf(
         powf(vx * speed, 2) +
-        powf(vy * speed + ABS(dy) * 2, 2) +
+        powf(vy * speed + ABS(g->dy) * 2, 2) +
         powf(vz * speed, 2)) * dt * 8);
     int step = MAX(8, estimate);
     float ut = dt / step;
@@ -2639,17 +2924,25 @@ void handle_movement(double dt) {
     vz = vz * ut * speed;
     for (int i = 0; i < step; i++) {
         if (g->flying) {
-            dy = 0;
+            g->dy = 0;
         }
         else {
-            dy -= ut * 25;
-            dy = MAX(dy, -250);
+            g->dy -= ut * 25;
+            g->dy = MAX(g->dy, -250);
         }
         s->x += vx;
-        s->y += vy + dy * ut;
+        s->y += vy + g->dy * ut;
         s->z += vz;
         if (collide(2, &s->x, &s->y, &s->z)) {
-            dy = 0;
+            // Landing: the speed says how far the fall was. Four blocks are
+            // free, everything above that hurts.
+            if (g->dy < 0) {
+                float distance = (g->dy * g->dy) / 50.0;
+                if (distance > 4) {
+                    hurt_player(distance - 4);
+                }
+            }
+            g->dy = 0;
         }
     }
     if (s->y < 0) {
@@ -2763,6 +3056,11 @@ void reset_model() {
     g->observe2 = 0;
     g->flying = 0;
     g->item_index = 0;
+    g->dy = 0;
+    g->dead = 0;
+    g->hurt_timer = 0;
+    g->regen_timer = 0;
+    g->health = MAX_HEALTH;
     memset(g->typing_buffer, 0, sizeof(char) * MAX_TEXT_LENGTH);
     g->typing = 0;
     memset(g->messages, 0, sizeof(char) * MAX_MESSAGES * MAX_TEXT_LENGTH);
@@ -2910,6 +3208,18 @@ int main(int argc, char **argv) {
         snprintf(g->db_path, MAX_PATH_LENGTH, "%s", DB_PATH);
     }
 
+    inventory_init();
+#ifdef __EMSCRIPTEN__
+    // onRuntimeInitialized fires before main() runs: at that moment the item
+    // registry is still empty, and an interface that reads it then gets
+    // nothing. So the game says when it is actually ready.
+    EM_ASM({
+        if (window.CraftUI && CraftUI.gameReady) {
+            CraftUI.gameReady();
+        }
+    });
+#endif
+
     g->create_radius = CREATE_CHUNK_RADIUS;
     g->render_radius = RENDER_CHUNK_RADIUS;
     g->delete_radius = DELETE_CHUNK_RADIUS;
@@ -2981,6 +3291,24 @@ int main(int argc, char **argv) {
             s->y = highest_block(s->x, s->z) + 2;
         }
 
+        // INVENTORY, HEALTH AND GAME MODE //
+        char meta[2048];
+        if (db_get_meta("mode", meta, sizeof(meta))) {
+            set_game_mode(atoi(meta));
+        }
+        if (db_get_meta("inventory", meta, sizeof(meta))) {
+            inventory_load_string(meta);
+        }
+        else {
+            inv_give_starting_items(g->game_mode);
+        }
+        if (db_get_meta("health", meta, sizeof(meta))) {
+            g->health = atof(meta);
+            if (g->health <= 0) {
+                g->health = MAX_HEALTH;
+            }
+        }
+
         // BEGIN MAIN LOOP //
         double previous = glfwGetTime();
         while (1) {
@@ -3009,6 +3337,9 @@ int main(int argc, char **argv) {
             // HANDLE MOVEMENT //
             handle_movement(dt);
 
+            // SURVIVAL //
+            survival_tick(dt);
+
             // HANDLE DATA FROM SERVER //
             char *buffer = client_recv();
             if (buffer) {
@@ -3017,8 +3348,19 @@ int main(int argc, char **argv) {
             }
 
             // FLUSH DATABASE //
+#ifdef __EMSCRIPTEN__
+            // the menu asked for a save on its own turn, see craft_save_now()
+            if (web_save_requested) {
+                web_save_requested = 0;
+                last_commit = now;
+                save_player_meta();
+                db_commit();
+                web_save_world();
+            }
+#endif
             if (now - last_commit > COMMIT_INTERVAL) {
                 last_commit = now;
+                save_player_meta();
 #ifdef __EMSCRIPTEN__
                 // A browser tab is never shut down properly, so the position
                 // has to be written with every commit -- not only in the
@@ -3170,6 +3512,7 @@ int main(int argc, char **argv) {
 
         // SHUTDOWN //
         db_save_state(s->x, s->y, s->z, s->rx, s->ry);
+        save_player_meta();
         db_close();
 #ifdef __EMSCRIPTEN__
         web_save_world();

@@ -19,6 +19,8 @@ int db_auth_get(
 int db_auth_get_selected(
     char *username, int username_length,
     char *identity_token, int identity_token_length);
+void db_set_meta(const char *key, const char *value);
+int db_get_meta(const char *key, char *value, int length);
 void db_save_state(float x, float y, float z, float rx, float ry);
 int db_load_state(float *x, float *y, float *z, float *rx, float *ry);
 void db_insert_block(int p, int q, int x, int y, int z, int w);

@@ -25,6 +25,16 @@
 #define SUN_FLOWER 21
 #define WHITE_FLOWER 22
 #define BLUE_FLOWER 23
+
+// blocks this fork adds
+#define WATER 24
+#define COAL_ORE 25
+#define IRON_ORE 26
+#define GEM_ORE 27
+#define EMBER_ROCK 28
+#define ASH_SAND 29
+#define GLOW_ROCK 30
+#define EMBER_BRICK 31
 #define COLOR_00 32
 #define COLOR_01 33
 #define COLOR_02 34
@@ -57,15 +67,21 @@
 #define COLOR_29 61
 #define COLOR_30 62
 #define COLOR_31 63
+#define PORTAL_STONE 64
+#define PORTAL 65
+#define LAVA 66
 
 extern const int items[];
 extern const int item_count;
-extern const int blocks[256][6];
-extern const int plants[256];
+// not const: an add-on may register a block at runtime
+extern int blocks[256][6];
+extern int plants[256];
 
 int is_plant(int w);
 int is_obstacle(int w);
 int is_transparent(int w);
 int is_destructable(int w);
+int is_liquid(int w);
+int is_light_source(int w);
 
 #endif

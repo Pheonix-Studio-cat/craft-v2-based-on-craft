@@ -16,6 +16,10 @@ void make_plant(
     float *data, float ao, float light,
     float px, float py, float pz, float n, int w, float rotation);
 
+void make_sprite(
+    float *data, float ao, float light,
+    float px, float py, float pz, float n, int tile, float rotation);
+
 void make_player(
     float *data,
     float x, float y, float z, float rx, float ry);
