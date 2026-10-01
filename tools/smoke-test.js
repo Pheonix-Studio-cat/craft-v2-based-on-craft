@@ -454,15 +454,169 @@ async function diff(page, a, b) {
         await page.evaluate(() => { Module._craft_toggle_fly(); });
     }
 
-    // ---- the underworld (beta) ----
+    // ---- what the blocks do ----
+    // mining in survival has to wait between blocks
     await page.evaluate(() => {
         Module._craft_respawn();
         Module._craft_clear_mobs();
+        // a crossbow in the hand makes the button shoot, which is the point
+        // of the crossbow -- so put a pickaxe there for the mining test
+        Module._craft_set_game_mode(0);
+        Module._craft_select_slot(0);
+        Module._craft_inv_give(160, 1);     // pickaxe
+        Module._craft_set_game_mode(1);
+        Module._craft_touch_look(0, 420);
+    });
+    await page.waitForTimeout(500);
+    const mined = [];
+    for (let i = 0; i < 6; i++) {
+        mined.push(await page.evaluate(() => {
+            Module._craft_break_block();
+            return Module._craft_mine_cooldown();
+        }));
+        await page.waitForTimeout(200);
+    }
+    check('phone: breaking a block starts a wait in survival',
+        mined.some(v => v > 0), 'cooldown readings ' + JSON.stringify(mined));
+    await page.evaluate(() => Module._craft_break_block());
+    await page.waitForTimeout(160);
+    check('phone: the break button shows the wait',
+        await page.locator('#break.cooling').count() === 1);
+    await page.waitForTimeout(1500);
+    check('phone: the wait runs out',
+        await page.evaluate(() => Module._craft_mine_cooldown()) === 0);
+
+    // ... and creative mode has none
+    await page.evaluate(() => Module._craft_set_game_mode(0));
+    await tap('#break');
+    check('phone: creative mode has no wait',
+        await page.evaluate(() => Module._craft_mine_cooldown()) === 0);
+
+    // flying: allowed in creative, refused in survival
+    await page.evaluate(() => { Module._craft_toggle_fly(); });
+    const flyCreative = await page.evaluate(() => Module._craft_is_flying());
+    await page.evaluate(() => Module._craft_set_game_mode(1));
+    const flyAfterSwitch = await page.evaluate(() => Module._craft_is_flying());
+    await page.evaluate(() => Module._craft_toggle_fly());
+    const flySurvival = await page.evaluate(() => Module._craft_is_flying());
+    check('phone: flying works in creative mode', flyCreative === 1);
+    check('phone: switching to survival turns flying off', flyAfterSwitch === 0);
+    check('phone: flying cannot be turned on in survival', flySurvival === 0);
+    await page.waitForTimeout(300);
+    check('phone: and the fly button is gone in survival',
+        await page.locator('#fly.hidden').count() === 1);
+
+    // a lamp lights its surroundings
+    await page.evaluate(() => {
+        Module._craft_respawn();            // resets the view as well
+        Module._craft_set_game_mode(0);
+        Module._craft_select_slot(0);
+        Module._craft_inv_give(12, 1);      // 12 = lamp
+        Module._craft_touch_look(0, 300);
+    });
+    await page.waitForTimeout(600);
+    await tap('#break');                    // grass first, it is not solid
+    await page.waitForTimeout(300);
+    await tap('#place');
+    await page.waitForTimeout(1200);
+    await page.screenshot({ path: OUT + '/shot-11-lamp.png' });
+    check('phone: a lamp can be placed', await page.evaluate(() => {
+        const x = Math.round(Module._craft_probe(0));
+        const y = Math.round(Module._craft_probe(1));
+        const z = Math.round(Module._craft_probe(2));
+        for (let dx = -3; dx <= 3; dx++)
+            for (let dy = -3; dy <= 2; dy++)
+                for (let dz = -3; dz <= 3; dz++)
+                    if (Module._craft_block_at(x + dx, y + dy, z + dz) === 12) return true;
+        return false;
+    }));
+
+    // a chest keeps what is put into it, across a reload
+    await page.evaluate(() => {
+        Module._craft_select_slot(0);
+        Module._craft_inv_give(14, 1);      // 14 = chest
+        Module._craft_touch_look(0, 60);    // a little higher, next to the lamp
+    });
+    await page.waitForTimeout(400);
+    await tap('#break');
+    await page.waitForTimeout(300);
+    await tap('#place');
+    await page.waitForTimeout(500);
+    await tap('#place');                    // tapping it again opens it
+    await page.waitForTimeout(600);
+    check('phone: a chest opens',
+        await page.evaluate(() => Module._craft_container_open()) === 1);
+    check('phone: the chest screen is showing',
+        (await page.locator('#panel h1').textContent()) === 'Chest');
+
+    // put the first bag slot in, check it landed, close, reopen
+    const putItem = await page.evaluate(() => {
+        Module._craft_select_slot(1);
+        Module._craft_inv_give(3, 7);       // seven stone
+        const item = Module._craft_inv_item(1);
+        Module._craft_container_put(1);
+        return item;
+    });
+    await page.waitForTimeout(400);
+    check('phone: the chest takes what is put in',
+        await page.evaluate(() => Module._craft_container_item(0)) === putItem,
+        'stored ' + await page.evaluate(() => Module._craft_container_count(0)));
+    await page.screenshot({ path: OUT + '/shot-12-chest.png' });
+    await tap('#panel .close');
+    await page.waitForTimeout(400);
+    check('phone: closing the chest screen closes the chest',
+        await page.evaluate(() => Module._craft_container_open()) === 0);
+
+    await page.reload();
+    await page.waitForSelector('#controls:not(.hidden)', { timeout: 120000 });
+    await page.waitForTimeout(4000);
+    const chestAfterReload = await page.evaluate(() => {
+        const x = Math.round(Module._craft_probe(0));
+        const y = Math.round(Module._craft_probe(1));
+        const z = Math.round(Module._craft_probe(2));
+        for (let dx = -3; dx <= 3; dx++)
+            for (let dy = -3; dy <= 2; dy++)
+                for (let dz = -3; dz <= 3; dz++)
+                    if (Module._craft_block_at(x + dx, y + dy, z + dz) === 14) {
+                        Module._craft_container_open();  // just asking
+                        return [x + dx, y + dy, z + dz];
+                    }
+        return null;
+    });
+    check('phone: the chest is still there after a reload', chestAfterReload !== null,
+        JSON.stringify(chestAfterReload));
+
+    // ---- the underworld (beta) ----
+    const dry = await page.evaluate(() => {
+        // Untouched, dry ground: away from the holes the earlier steps dug,
+        // and out of the sea -- a stone cannot be placed into water either.
+        Module._craft_respawn();
+        Module._craft_clear_mobs();
+        for (let r = 8; r < 40; r += 2) {
+            const ring = [[r, 0], [0, r], [-r, 0], [0, -r], [r, r], [-r, -r]];
+            for (const [dx, dz] of ring) {
+                for (let y = 24; y > 13; y--) {
+                    const here = Module._craft_block_at(dx, y, dz);
+                    if (here === 0 || here === 24) continue;
+                    if (Module._craft_block_at(dx, y + 1, dz) === 0 &&
+                        Module._craft_block_at(dx, y + 2, dz) === 0) {
+                        return [dx, y, dz];
+                    }
+                    break;
+                }
+            }
+        }
+        return null;
+    });
+    check('phone: dry ground for the gateway', dry !== null, JSON.stringify(dry));
+    await page.evaluate(([x, y, z]) => {
+        Module._craft_teleport(x, y + 2.5, z);
         Module._craft_set_game_mode(0);
         Module._craft_select_slot(0);
         Module._craft_inv_give(64, 1);      // portal stone
         Module._craft_touch_look(0, 420);   // look straight at the ground
-    });
+    }, dry);
+    await page.waitForTimeout(1200);        // land, and let the chunk settle
     await page.waitForTimeout(500);
     await tap('#break');                    // clear the grass in the way
     await page.waitForTimeout(300);

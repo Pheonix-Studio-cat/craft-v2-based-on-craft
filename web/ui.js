@@ -24,6 +24,8 @@ var CraftUI = (function () {
     var lastVersion = -1;
     var lastHealth = -1;
     var lastAir = -1;
+    var lastMode = -1;
+    var lastCooldown = -1;
     var pickedSlot = -1;
     var currentTab = 'bag';
     var modalKind = null;
@@ -392,6 +394,9 @@ var CraftUI = (function () {
     }
 
     function closeModal() {
+        if (modalKind === 'chest') {
+            call('craft_container_close');
+        }
         modalKind = null;
         pickedSlot = -1;
         modal.classList.add('hidden');
@@ -413,6 +418,7 @@ var CraftUI = (function () {
         else if (modalKind === 'inventory') renderInventory();
         else if (modalKind === 'death') renderDeath();
         else if (modalKind === 'market') renderMarket();
+        else if (modalKind === 'chest') renderChest();
         else if (modalKind === 'help') renderHelp();
     }
 
@@ -618,6 +624,50 @@ var CraftUI = (function () {
         panel.appendChild(grid);
     }
 
+    // ---------------------------------------------------------------- chest
+    function renderChest() {
+        panel.appendChild(el('h1', null, 'Chest'));
+        panel.appendChild(el('p', null,
+            'Tap something in the chest to take it. Tap something in your ' +
+            'bag to put it in.'));
+
+        var size = call('craft_container_size');
+        var chest = el('div', 'grid');
+        for (var i = 0; i < size; i++) {
+            (function (index) {
+                var node = el('div', 'slot');
+                paintSlot(node, call('craft_container_item', index),
+                    call('craft_container_count', index));
+                node.addEventListener('click', function () {
+                    call('craft_container_take', index);
+                    renderModal();
+                    renderHotbar();
+                });
+                chest.appendChild(node);
+            })(i);
+        }
+        panel.appendChild(chest);
+
+        panel.appendChild(el('h2', null, 'Your bag'));
+        var bag = el('div', 'grid');
+        for (var j = 0; j < 36; j++) {
+            (function (index) {
+                var node = el('div', 'slot');
+                paintSlot(node, call('craft_inv_item', index),
+                    call('craft_inv_count', index));
+                node.addEventListener('click', function () {
+                    call('craft_container_put', index);
+                    renderModal();
+                    renderHotbar();
+                });
+                bag.appendChild(node);
+            })(j);
+        }
+        panel.appendChild(bag);
+
+        panel.appendChild(button('▶  Close the chest', null, 'primary', closeModal));
+    }
+
     // ---------------------------------------------------------------- death
     function renderDeath() {
         panel.appendChild(el('h1', null, 'You died'));
@@ -638,6 +688,9 @@ var CraftUI = (function () {
          ['▣', 'place the block that is in the selected slot'],
          ['Crossbow', 'select it in the hotbar, then ⛏ shoots a bolt'],
          ['Gateway', 'craft a Portal Stone, place it, light it with the Fire Starter, step in'],
+         ['Chest', 'place one, then tap it with ▣ to open it'],
+         ['Lamp', 'a placed lamp lights the room; so does glowing stone and lava'],
+         ['Mining', 'in survival every block takes its time — the right tool halves it'],
          ['🎒', 'inventory and crafting'],
          ['✈', 'flying, creative mode only'],
          ['Keyboard', 'WASD, space, 1–9, tab']
@@ -780,6 +833,32 @@ var CraftUI = (function () {
             lastAir = air;
             renderAir();
         }
+        // the game mode may come from the saved world, after the interface
+        // was already built -- so watch it, do not assume it
+        var mode = call('craft_game_mode');
+        if (mode !== lastMode) {
+            lastMode = mode;
+            updateButtons();
+            renderHearts();
+            renderAir();
+        }
+
+        // how long until the next block can be broken
+        var cooling = call('craft_mine_cooldown');
+        if (cooling !== lastCooldown) {
+            lastCooldown = cooling;
+            var breakButton = document.getElementById('break');
+            breakButton.classList.toggle('cooling', cooling > 0);
+            breakButton.style.setProperty('--cool', (cooling / 100).toFixed(2));
+        }
+
+        if (call('craft_container_open') && modalKind !== 'chest') {
+            openModal('chest');
+        }
+        else if (modalKind === 'chest' && !call('craft_container_open')) {
+            closeModal();
+        }
+
         if (call('craft_is_dead') && modalKind !== 'death') {
             openModal('death');
         }
@@ -820,7 +899,7 @@ var CraftUI = (function () {
         renderAir();
         updateButtons();
         resize();
-        setInterval(poll, 200);
+        setInterval(poll, 100);
 
         var seen = false;
         try { seen = localStorage.getItem('craft.seen') === '1'; } catch (e) {}

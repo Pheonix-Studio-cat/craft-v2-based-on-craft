@@ -18,6 +18,7 @@
 #include "config.h"
 #include "cube.h"
 #include "addon.h"
+#include "container.h"
 #include "db.h"
 #include "entity.h"
 #include "inventory.h"
@@ -174,6 +175,8 @@ typedef struct {
     int portal_ready;    // the player has left the gateway they arrived in
     int paused;          // a menu is open: creatures wait
     float attack_timer;  // seconds until the next swing is allowed
+    float mine_timer;    // seconds until the next block can be broken
+    float mine_total;    // how long that wait was, for the progress ring
     int scale;
     int ortho;
     float fov;
@@ -1031,7 +1034,7 @@ void compute_chunk(WorkerItem *item) {
     int oy = -1;
     int oz = item->q * CHUNK_SIZE - CHUNK_SIZE - 1;
 
-    // check for lights
+    // check for lights -- placed ones, and blocks that shine by themselves
     int has_light = 0;
     if (SHOW_LIGHTS) {
         for (int a = 0; a < 3; a++) {
@@ -1040,6 +1043,20 @@ void compute_chunk(WorkerItem *item) {
                 if (map && map->size) {
                     has_light = 1;
                 }
+            }
+        }
+        for (int a = 0; a < 3 && !has_light; a++) {
+            for (int b = 0; b < 3 && !has_light; b++) {
+                Map *map = item->block_maps[a][b];
+                if (!map) {
+                    continue;
+                }
+                MAP_FOR_EACH(map, ex, ey, ez, ew) {
+                    (void)ex; (void)ey; (void)ez;
+                    if (light_value(ew)) {
+                        has_light = 1;
+                    }
+                } END_MAP_FOR_EACH;
             }
         }
     }
@@ -1086,6 +1103,32 @@ void compute_chunk(WorkerItem *item) {
                     int y = ey - oy;
                     int z = ez - oz;
                     light_fill(opaque, light, x, y, z, ew, 1);
+                } END_MAP_FOR_EACH;
+            }
+        }
+        // A lamp, glowing stone, lava and an open gateway light their own
+        // surroundings. Overlapping fills cost almost nothing: light_fill
+        // stops as soon as a cell is already at least as bright.
+        for (int a = 0; a < 3; a++) {
+            for (int b = 0; b < 3; b++) {
+                Map *map = item->block_maps[a][b];
+                if (!map) {
+                    continue;
+                }
+                MAP_FOR_EACH(map, ex, ey, ez, ew) {
+                    int value = light_value(ew);
+                    if (!value) {
+                        continue;
+                    }
+                    int x = ex - ox;
+                    int y = ey - oy;
+                    int z = ez - oz;
+                    if (x < 0 || y < 0 || z < 0 ||
+                        x >= XZ_SIZE || y >= Y_SIZE || z >= XZ_SIZE)
+                    {
+                        continue;
+                    }
+                    light_fill(opaque, light, x, y, z, value, 1);
                 } END_MAP_FOR_EACH;
             }
         }
@@ -2362,6 +2405,7 @@ void travel_to_dimension(int dimension) {
         return;
     }
     // take everything that belongs to the player with us
+    container_close();
     db_save_state(s->x, s->y, s->z, s->rx, s->ry);
     save_player_meta();
     db_commit();
@@ -2472,6 +2516,7 @@ void heal_player(float amount) {
 
 void respawn_player() {
     State *s = &g->players->state;
+    container_close();
     entities_clear();
     s->x = 0;
     s->z = 0;
@@ -2645,20 +2690,77 @@ void attack_or_shoot() {
     on_left_click();
 }
 
+// How long the player has to wait after breaking a block. Stone takes its
+// time, dirt does not, and the right tool roughly halves it. Creative mode
+// has no wait at all -- there, building is the whole point.
+float block_break_time(int w, int item) {
+    float base;
+    switch (ABS(w)) {
+        case TALL_GRASS: case YELLOW_FLOWER: case RED_FLOWER:
+        case PURPLE_FLOWER: case SUN_FLOWER: case WHITE_FLOWER:
+        case BLUE_FLOWER: case LEAVES:
+            base = 0.15;
+            break;
+        case DIRT: case GRASS: case SAND: case SNOW: case ASH_SAND:
+            base = 0.35;
+            break;
+        case WOOD: case PLANK: case CHEST:
+            base = 0.55;
+            break;
+        case GLASS:
+            base = 0.30;
+            break;
+        case COAL_ORE: case IRON_ORE: case GEM_ORE: case GLOW_ROCK:
+            base = 1.40;
+            break;
+        case STONE: case COBBLE: case BRICK: case CEMENT: case DARK_STONE:
+        case LIGHT_STONE: case EMBER_ROCK: case EMBER_BRICK: case PORTAL_STONE:
+            base = 1.00;
+            break;
+        default:
+            base = 0.60;
+            break;
+    }
+    // the right tool for the job
+    int stony = base >= 1.0;
+    int woody = ABS(w) == WOOD || ABS(w) == PLANK || ABS(w) == CHEST ||
+                ABS(w) == LEAVES;
+    int diggy = ABS(w) == DIRT || ABS(w) == GRASS || ABS(w) == SAND ||
+                ABS(w) == SNOW || ABS(w) == ASH_SAND;
+    if ((item == ITEM_PICKAXE && stony) ||
+        (item == ITEM_AXE && woody) ||
+        (item == ITEM_SHOVEL && diggy))
+    {
+        base *= 0.45;
+    }
+    return base;
+}
+
 void on_left_click() {
     State *s = &g->players->state;
     if (g->dead) {
         return;
     }
+    if (g->game_mode == GAME_SURVIVAL && g->mine_timer > 0) {
+        return;               // still catching breath from the last block
+    }
     int hx, hy, hz;
     int hw = hit_test(0, s->x, s->y, s->z, s->rx, s->ry, &hx, &hy, &hz);
     if (hy > 0 && hy < 256 && is_destructable(hw)) {
+        if (g->game_mode == GAME_SURVIVAL) {
+            g->mine_total = block_break_time(hw, held_item());
+            g->mine_timer = g->mine_total;
+        }
         set_block(hx, hy, hz, 0);
         record_block(hx, hy, hz, 0);
         if (is_plant(get_block(hx, hy + 1, hz))) {
             set_block(hx, hy + 1, hz, 0);
         }
         flood_water(hx, hy, hz);
+        if (hw == CHEST) {
+            container_break(hx, hy, hz);
+            add_message("The chest spills its contents into your bag.");
+        }
         // In survival the block goes into the bag; in creative it is gone,
         // because there the bag is bottomless anyway.
         if (g->game_mode == GAME_SURVIVAL) {
@@ -2674,6 +2776,15 @@ void on_right_click() {
     State *s = &g->players->state;
     if (g->dead) {
         return;
+    }
+    // A chest is a thing you open, not a thing you build against.
+    {
+        int cx, cy, cz;
+        int cw = hit_test(0, s->x, s->y, s->z, s->rx, s->ry, &cx, &cy, &cz);
+        if (cw == CHEST) {
+            container_open(cx, cy, cz);
+            return;
+        }
     }
     ItemType *type = held_type();
     if (!type) {
@@ -3006,6 +3117,15 @@ EMSCRIPTEN_KEEPALIVE int craft_max_health() {
 }
 
 // 0 .. 100, how much breath is left; 100 also means "not under water"
+// 0 while the player may break a block, else how much of the wait is left,
+// from 100 down to 0.
+EMSCRIPTEN_KEEPALIVE int craft_mine_cooldown() {
+    if (g->mine_timer <= 0 || g->mine_total <= 0) {
+        return 0;
+    }
+    return (int)(100 * g->mine_timer / g->mine_total);
+}
+
 EMSCRIPTEN_KEEPALIVE int craft_air() {
     return (int)(100 * g->air / MAX_AIR);
 }
@@ -3178,6 +3298,38 @@ EMSCRIPTEN_KEEPALIVE void craft_addon_reset() {
 
 EMSCRIPTEN_KEEPALIVE int craft_addon_count() {
     return addon_block_count() + addon_item_count();
+}
+
+// --- chests ---------------------------------------------------------------
+
+EMSCRIPTEN_KEEPALIVE int craft_container_open() {
+    return container_is_open();
+}
+
+EMSCRIPTEN_KEEPALIVE int craft_container_size() {
+    return CHEST_SLOTS;
+}
+
+EMSCRIPTEN_KEEPALIVE int craft_container_item(int index) {
+    Slot *slot = container_slot(index);
+    return slot ? slot->item : 0;
+}
+
+EMSCRIPTEN_KEEPALIVE int craft_container_count(int index) {
+    Slot *slot = container_slot(index);
+    return slot ? slot->count : 0;
+}
+
+EMSCRIPTEN_KEEPALIVE int craft_container_take(int index) {
+    return container_take(index);
+}
+
+EMSCRIPTEN_KEEPALIVE int craft_container_put(int index) {
+    return container_put(index);
+}
+
+EMSCRIPTEN_KEEPALIVE void craft_container_close() {
+    container_close();
 }
 
 EMSCRIPTEN_KEEPALIVE int craft_dimension() {
@@ -3553,6 +3705,8 @@ void reset_model() {
     g->portal_ready = 1;
     g->paused = 0;
     g->attack_timer = 0;
+    g->mine_timer = 0;
+    g->mine_total = 0;
     g->dimension = 0;
     g->hurt_timer = 0;
     g->regen_timer = 0;
@@ -3848,6 +4002,9 @@ int main(int argc, char **argv) {
             survival_tick(dt);
             if (g->attack_timer > 0) {
                 g->attack_timer -= dt;
+            }
+            if (g->mine_timer > 0) {
+                g->mine_timer -= dt;
             }
 
             // CREATURES //

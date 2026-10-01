@@ -85,6 +85,7 @@ int inv_remove_at(int index, int count);
 void inv_move(int from, int to);
 void inv_set_slot(int index, int item, int count);
 int inv_version();
+void inv_touch_version();
 
 int recipe_count();
 Recipe *recipe_at(int index);

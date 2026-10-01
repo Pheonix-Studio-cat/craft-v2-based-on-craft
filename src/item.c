@@ -209,8 +209,25 @@ int is_liquid(int w) {
 }
 
 int is_light_source(int w) {
-    w = ABS(w);
-    return w == LIGHT_STONE || w == GLOW_ROCK || w == LAVA || w == PORTAL;
+    return light_value(w) > 0;
+}
+
+// How brightly a block shines by itself, 0 to 15. A lamp is a lamp whether
+// someone placed it or the world generator did -- the chunk mesher reads
+// this while it builds the light map.
+int light_value(int w) {
+    switch (ABS(w)) {
+        case LIGHT_STONE:
+            return 14;
+        case GLOW_ROCK:
+            return 12;
+        case LAVA:
+            return 10;
+        case PORTAL:
+            return 10;
+        default:
+            return 0;
+    }
 }
 
 int is_transparent(int w) {

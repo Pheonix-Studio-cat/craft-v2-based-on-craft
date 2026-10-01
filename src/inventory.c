@@ -256,6 +256,11 @@ int inv_version() {
     return version;
 }
 
+// Something outside changed a slot -- say, a chest took from it.
+void inv_touch_version() {
+    version++;
+}
+
 // Returns what did not fit.
 int inv_add(int item, int count) {
     ItemType *type = item_type(item);
