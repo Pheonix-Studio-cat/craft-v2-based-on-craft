@@ -1,3 +1,4 @@
+#include <stdio.h>
 #include <string.h>
 #include "db.h"
 #include "ring.h"
@@ -88,6 +89,10 @@ int db_init(char *path) {
         "    z int not null,"
         "    face int not null,"
         "    text text not null"
+        ");"
+        "create table if not exists meta ("
+        "    key text primary key not null,"
+        "    value text not null"
         ");"
         "create unique index if not exists block_pqxyz_idx on block (p, q, x, y, z);"
         "create unique index if not exists light_pqxyz_idx on light (p, q, x, y, z);"
@@ -277,6 +282,46 @@ int db_auth_get_selected(
     }
     sqlite3_finalize(stmt);
     return result;
+}
+
+// Free-form key/value storage, used for the inventory, the health and the
+// game mode. A new table, so an existing world file keeps working.
+void db_set_meta(const char *key, const char *value) {
+    if (!db_enabled) {
+        return;
+    }
+    static const char *query =
+        "insert or replace into meta (key, value) values (?, ?);";
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(db, query, -1, &stmt, NULL)) {
+        return;
+    }
+    sqlite3_bind_text(stmt, 1, key, -1, NULL);
+    sqlite3_bind_text(stmt, 2, value, -1, NULL);
+    sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+}
+
+int db_get_meta(const char *key, char *value, int length) {
+    if (!db_enabled) {
+        return 0;
+    }
+    static const char *query = "select value from meta where key = ?;";
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(db, query, -1, &stmt, NULL)) {
+        return 0;
+    }
+    sqlite3_bind_text(stmt, 1, key, -1, NULL);
+    int found = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        const unsigned char *text = sqlite3_column_text(stmt, 0);
+        if (text) {
+            snprintf(value, length, "%s", text);
+            found = 1;
+        }
+    }
+    sqlite3_finalize(stmt);
+    return found;
 }
 
 void db_save_state(float x, float y, float z, float rx, float ry) {

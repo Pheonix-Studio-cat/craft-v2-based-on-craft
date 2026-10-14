@@ -10,6 +10,21 @@ void make_cube_faces(
     int wleft, int wright, int wtop, int wbottom, int wfront, int wback,
     float x, float y, float z, float n)
 {
+    make_box_faces(
+        data, ao, light,
+        left, right, top, bottom, front, back,
+        wleft, wright, wtop, wbottom, wfront, wback,
+        x, y, z, n, n, n);
+}
+
+// The same six faces, but with a separate half size per axis -- a creature
+// is taller than it is wide.
+void make_box_faces(
+    float *data, float ao[6][4], float light[6][4],
+    int left, int right, int top, int bottom, int front, int back,
+    int wleft, int wright, int wtop, int wbottom, int wfront, int wback,
+    float x, float y, float z, float nx, float ny, float nz)
+{
     static const float positions[6][4][3] = {
         {{-1, -1, -1}, {-1, -1, +1}, {-1, +1, -1}, {-1, +1, +1}},
         {{+1, -1, -1}, {+1, -1, +1}, {+1, +1, -1}, {+1, +1, +1}},
@@ -65,9 +80,9 @@ void make_cube_faces(
         int flip = ao[i][0] + ao[i][3] > ao[i][1] + ao[i][2];
         for (int v = 0; v < 6; v++) {
             int j = flip ? flipped[i][v] : indices[i][v];
-            *(d++) = x + n * positions[i][j][0];
-            *(d++) = y + n * positions[i][j][1];
-            *(d++) = z + n * positions[i][j][2];
+            *(d++) = x + nx * positions[i][j][0];
+            *(d++) = y + ny * positions[i][j][1];
+            *(d++) = z + nz * positions[i][j][2];
             *(d++) = normals[i][0];
             *(d++) = normals[i][1];
             *(d++) = normals[i][2];
@@ -101,6 +116,15 @@ void make_plant(
     float *data, float ao, float light,
     float px, float py, float pz, float n, int w, float rotation)
 {
+    make_sprite(data, ao, light, px, py, pz, n, plants[w], rotation);
+}
+
+// The same two crossed quads a plant is made of, but with the atlas tile
+// given directly -- that is how a tool or a weapon is drawn in the hand.
+void make_sprite(
+    float *data, float ao, float light,
+    float px, float py, float pz, float n, int tile, float rotation)
+{
     static const float positions[4][4][3] = {
         {{ 0, -1, -1}, { 0, -1, +1}, { 0, +1, -1}, { 0, +1, +1}},
         {{ 0, -1, -1}, { 0, -1, +1}, { 0, +1, -1}, { 0, +1, +1}},
@@ -129,8 +153,8 @@ void make_plant(
     float s = 0.0625;
     float a = 0;
     float b = s;
-    float du = (plants[w] % 16) * s;
-    float dv = (plants[w] / 16) * s;
+    float du = (tile % 16) * s;
+    float dv = (tile / 16) * s;
     for (int i = 0; i < 4; i++) {
         for (int v = 0; v < 6; v++) {
             int j = indices[i][v];
@@ -155,6 +179,40 @@ void make_plant(
     mat_translate(mb, px, py, pz);
     mat_multiply(ma, mb, ma);
     mat_apply(data, ma, 24, 0, 10);
+}
+
+void make_mob(
+    float *data, float x, float y, float z, float rx,
+    int tile, float width, float height, float light_value)
+{
+    float ao[6][4] = {0};
+    float light[6][4];
+    for (int i = 0; i < 6; i++) {
+        for (int j = 0; j < 4; j++) {
+            light[i][j] = light_value;
+        }
+    }
+    float body = height * 0.34;
+    float head = width * 0.75;
+    // built around the origin, then turned and moved into place
+    make_box_faces(
+        data, ao, light, 1, 1, 1, 1, 1, 1,
+        tile, tile, tile, tile, tile, tile,
+        0, body, 0, width, body, width * 0.8);
+    make_box_faces(
+        data + 360, ao, light, 1, 1, 1, 1, 1, 1,
+        tile, tile, tile, tile, tile, tile,
+        0, height - head, 0, head, head, head);
+
+    float ma[16];
+    float mb[16];
+    mat_identity(ma);
+    mat_rotate(mb, 0, 1, 0, -rx);
+    mat_multiply(ma, mb, ma);
+    mat_apply(data, ma, 72, 3, 10);     // turn the normals
+    mat_apply(data, ma, 72, 0, 10);     // turn the body
+    mat_translate(mb, x, y, z);
+    mat_apply(data, mb, 72, 0, 10);     // and set it down in the world
 }
 
 void make_player(

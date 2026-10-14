@@ -56,12 +56,22 @@ const int items[] = {
     COLOR_28,
     COLOR_29,
     COLOR_30,
-    COLOR_31
+    COLOR_31,
+    // blocks this fork adds
+    COAL_ORE,
+    IRON_ORE,
+    GEM_ORE,
+    EMBER_ROCK,
+    ASH_SAND,
+    GLOW_ROCK,
+    EMBER_BRICK,
+    PORTAL_STONE,
+    WATER
 };
 
 const int item_count = sizeof(items) / sizeof(int);
 
-const int blocks[256][6] = {
+int blocks[256][6] = {
     // w => (left, right, top, bottom, front, back) tiles
     {0, 0, 0, 0, 0, 0}, // 0 - empty
     {16, 16, 32, 0, 16, 16}, // 1 - grass
@@ -87,14 +97,14 @@ const int blocks[256][6] = {
     {0, 0, 0, 0, 0, 0}, // 21
     {0, 0, 0, 0, 0, 0}, // 22
     {0, 0, 0, 0, 0, 0}, // 23
-    {0, 0, 0, 0, 0, 0}, // 24
-    {0, 0, 0, 0, 0, 0}, // 25
-    {0, 0, 0, 0, 0, 0}, // 26
-    {0, 0, 0, 0, 0, 0}, // 27
-    {0, 0, 0, 0, 0, 0}, // 28
-    {0, 0, 0, 0, 0, 0}, // 29
-    {0, 0, 0, 0, 0, 0}, // 30
-    {0, 0, 0, 0, 0, 0}, // 31
+    {64, 64, 64, 64, 64, 64}, // 24 - water
+    {65, 65, 65, 65, 65, 65}, // 25 - coal ore
+    {66, 66, 66, 66, 66, 66}, // 26 - iron ore
+    {74, 74, 74, 74, 74, 74}, // 27 - gem ore
+    {67, 67, 67, 67, 67, 67}, // 28 - ember rock
+    {68, 68, 68, 68, 68, 68}, // 29 - ash sand
+    {69, 69, 69, 69, 69, 69}, // 30 - glow rock
+    {70, 70, 70, 70, 70, 70}, // 31 - ember brick
     {176, 176, 176, 176, 176, 176}, // 32
     {177, 177, 177, 177, 177, 177}, // 33
     {178, 178, 178, 178, 178, 178}, // 34
@@ -127,9 +137,12 @@ const int blocks[256][6] = {
     {205, 205, 205, 205, 205, 205}, // 61
     {206, 206, 206, 206, 206, 206}, // 62
     {207, 207, 207, 207, 207, 207}, // 63
+    {71, 71, 71, 71, 71, 71}, // 64 - portal stone
+    {72, 72, 72, 72, 72, 72}, // 65 - portal
+    {73, 73, 73, 73, 73, 73}, // 66 - lava
 };
 
-const int plants[256] = {
+int plants[256] = {
     // w => tile
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 0 - 16
     48, // 17 - tall grass
@@ -140,6 +153,21 @@ const int plants[256] = {
     53, // 22 - white flower
     54, // 23 - blue flower
 };
+
+// Blocks an add-on registered at runtime. Bit 1 means transparent.
+static char addon_flags[256];
+
+void item_register_block(int w, int transparent) {
+    if (w <= 0 || w >= 256) {
+        return;
+    }
+    addon_flags[w] = 1 | (transparent ? 2 : 0);
+}
+
+int is_addon_block(int w) {
+    w = ABS(w);
+    return w > 0 && w < 256 && (addon_flags[w] & 1);
+}
 
 int is_plant(int w) {
     switch (w) {
@@ -164,9 +192,41 @@ int is_obstacle(int w) {
     switch (w) {
         case EMPTY:
         case CLOUD:
+        case WATER:
+        case LAVA:
+        case PORTAL:
             return 0;
         default:
             return 1;
+    }
+}
+
+// A liquid is drawn, swum through and hurts or slows the player, but never
+// stops them.
+int is_liquid(int w) {
+    w = ABS(w);
+    return w == WATER || w == LAVA;
+}
+
+int is_light_source(int w) {
+    return light_value(w) > 0;
+}
+
+// How brightly a block shines by itself, 0 to 15. A lamp is a lamp whether
+// someone placed it or the world generator did -- the chunk mesher reads
+// this while it builds the light map.
+int light_value(int w) {
+    switch (ABS(w)) {
+        case LIGHT_STONE:
+            return 14;
+        case GLOW_ROCK:
+            return 12;
+        case LAVA:
+            return 10;
+        case PORTAL:
+            return 10;
+        default:
+            return 0;
     }
 }
 
@@ -178,10 +238,16 @@ int is_transparent(int w) {
     if (is_plant(w)) {
         return 1;
     }
+    if (is_addon_block(w)) {
+        return (addon_flags[w] & 2) ? 1 : 0;
+    }
     switch (w) {
         case EMPTY:
         case GLASS:
         case LEAVES:
+        case WATER:
+        case LAVA:
+        case PORTAL:
             return 1;
         default:
             return 0;
@@ -192,6 +258,8 @@ int is_destructable(int w) {
     switch (w) {
         case EMPTY:
         case CLOUD:
+        case WATER:
+        case LAVA:
             return 0;
         default:
             return 1;

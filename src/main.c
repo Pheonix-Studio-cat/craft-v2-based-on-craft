@@ -17,7 +17,11 @@
 #include "client.h"
 #include "config.h"
 #include "cube.h"
+#include "addon.h"
+#include "container.h"
 #include "db.h"
+#include "entity.h"
+#include "inventory.h"
 #include "item.h"
 #include "map.h"
 #include "matrix.h"
@@ -47,6 +51,12 @@
 
 #define MODE_OFFLINE 0
 #define MODE_ONLINE 1
+
+// how the world is played, not how it is connected
+#define GAME_CREATIVE 0
+#define GAME_SURVIVAL 1
+
+#define MAX_HEALTH 20
 
 #define WORKER_IDLE 0
 #define WORKER_BUSY 1
@@ -126,6 +136,9 @@ typedef struct {
     GLuint extra2;
     GLuint extra3;
     GLuint extra4;
+    GLuint extra5;
+    GLuint extra6;
+    GLuint extra7;
 } Attrib;
 
 typedef struct {
@@ -148,7 +161,22 @@ typedef struct {
     int observe1;
     int observe2;
     int flying;
-    int item_index;
+    int item_index;      // the selected hotbar slot, 0 .. HOTBAR_SIZE - 1
+    int game_mode;       // GAME_CREATIVE or GAME_SURVIVAL
+    float health;        // 0 .. MAX_HEALTH, only counted in survival
+    float hurt_timer;    // seconds left before health starts coming back
+    float regen_timer;
+    float dy;            // vertical speed, kept here for the fall damage
+    int dead;
+    int dimension;       // 0 overworld, 1 underworld
+    float air;           // seconds of breath left under water
+    int underwater;      // the camera itself is in a liquid
+    float portal_timer;  // seconds before a portal works again
+    int portal_ready;    // the player has left the gateway they arrived in
+    int paused;          // a menu is open: creatures wait
+    float attack_timer;  // seconds until the next swing is allowed
+    float mine_timer;    // seconds until the next block can be broken
+    float mine_total;    // how long that wait was, for the progress ring
     int scale;
     int ortho;
     float fov;
@@ -168,6 +196,14 @@ typedef struct {
 
 static Model model;
 static Model *g = &model;
+
+// Used before they are defined, the way upstream's main.c does it for
+// nothing at all -- these four are the exception.
+int held_item();
+ItemType *held_type();
+void on_left_click();
+void hurt_player(float amount);
+void save_player_meta();
 
 int chunked(float x) {
     return floorf(roundf(x) / CHUNK_SIZE);
@@ -297,6 +333,14 @@ GLuint gen_plant_buffer(float x, float y, float z, float n, int w) {
     float ao = 0;
     float light = 1;
     make_plant(data, ao, light, x, y, z, n, w, 45);
+    return gen_faces(10, 4, data);
+}
+
+GLuint gen_sprite_buffer(float x, float y, float z, float n, int tile) {
+    GLfloat *data = malloc_faces(10, 4);
+    float ao = 0;
+    float light = 1;
+    make_sprite(data, ao, light, x, y, z, n, tile, 45);
     return gen_faces(10, 4, data);
 }
 
@@ -980,6 +1024,9 @@ void light_fill(
 
 void compute_chunk(WorkerItem *item) {
     char *opaque = (char *)calloc(XZ_SIZE * XZ_SIZE * Y_SIZE, sizeof(char));
+    // Water is transparent, so without this every face between two water
+    // blocks would be drawn -- a lake would cost thousands of hidden faces.
+    char *liquid = (char *)calloc(XZ_SIZE * XZ_SIZE * Y_SIZE, sizeof(char));
     char *light = (char *)calloc(XZ_SIZE * XZ_SIZE * Y_SIZE, sizeof(char));
     char *highest = (char *)calloc(XZ_SIZE * XZ_SIZE, sizeof(char));
 
@@ -987,7 +1034,7 @@ void compute_chunk(WorkerItem *item) {
     int oy = -1;
     int oz = item->q * CHUNK_SIZE - CHUNK_SIZE - 1;
 
-    // check for lights
+    // check for lights -- placed ones, and blocks that shine by themselves
     int has_light = 0;
     if (SHOW_LIGHTS) {
         for (int a = 0; a < 3; a++) {
@@ -996,6 +1043,20 @@ void compute_chunk(WorkerItem *item) {
                 if (map && map->size) {
                     has_light = 1;
                 }
+            }
+        }
+        for (int a = 0; a < 3 && !has_light; a++) {
+            for (int b = 0; b < 3 && !has_light; b++) {
+                Map *map = item->block_maps[a][b];
+                if (!map) {
+                    continue;
+                }
+                MAP_FOR_EACH(map, ex, ey, ez, ew) {
+                    (void)ex; (void)ey; (void)ez;
+                    if (light_value(ew)) {
+                        has_light = 1;
+                    }
+                } END_MAP_FOR_EACH;
             }
         }
     }
@@ -1021,6 +1082,7 @@ void compute_chunk(WorkerItem *item) {
                 }
                 // END TODO
                 opaque[XYZ(x, y, z)] = !is_transparent(w);
+                liquid[XYZ(x, y, z)] = is_liquid(w);
                 if (opaque[XYZ(x, y, z)]) {
                     highest[XZ(x, z)] = MAX(highest[XZ(x, z)], y);
                 }
@@ -1044,6 +1106,32 @@ void compute_chunk(WorkerItem *item) {
                 } END_MAP_FOR_EACH;
             }
         }
+        // A lamp, glowing stone, lava and an open gateway light their own
+        // surroundings. Overlapping fills cost almost nothing: light_fill
+        // stops as soon as a cell is already at least as bright.
+        for (int a = 0; a < 3; a++) {
+            for (int b = 0; b < 3; b++) {
+                Map *map = item->block_maps[a][b];
+                if (!map) {
+                    continue;
+                }
+                MAP_FOR_EACH(map, ex, ey, ez, ew) {
+                    int value = light_value(ew);
+                    if (!value) {
+                        continue;
+                    }
+                    int x = ex - ox;
+                    int y = ey - oy;
+                    int z = ez - oz;
+                    if (x < 0 || y < 0 || z < 0 ||
+                        x >= XZ_SIZE || y >= Y_SIZE || z >= XZ_SIZE)
+                    {
+                        continue;
+                    }
+                    light_fill(opaque, light, x, y, z, value, 1);
+                } END_MAP_FOR_EACH;
+            }
+        }
     }
 
     Map *map = item->block_maps[1][1];
@@ -1059,12 +1147,14 @@ void compute_chunk(WorkerItem *item) {
         int x = ex - ox;
         int y = ey - oy;
         int z = ez - oz;
-        int f1 = !opaque[XYZ(x - 1, y, z)];
-        int f2 = !opaque[XYZ(x + 1, y, z)];
-        int f3 = !opaque[XYZ(x, y + 1, z)];
-        int f4 = !opaque[XYZ(x, y - 1, z)] && (ey > 0);
-        int f5 = !opaque[XYZ(x, y, z - 1)];
-        int f6 = !opaque[XYZ(x, y, z + 1)];
+        int wet = is_liquid(ew);
+        int f1 = !opaque[XYZ(x - 1, y, z)] && !(wet && liquid[XYZ(x - 1, y, z)]);
+        int f2 = !opaque[XYZ(x + 1, y, z)] && !(wet && liquid[XYZ(x + 1, y, z)]);
+        int f3 = !opaque[XYZ(x, y + 1, z)] && !(wet && liquid[XYZ(x, y + 1, z)]);
+        int f4 = !opaque[XYZ(x, y - 1, z)] && (ey > 0) &&
+            !(wet && liquid[XYZ(x, y - 1, z)]);
+        int f5 = !opaque[XYZ(x, y, z - 1)] && !(wet && liquid[XYZ(x, y, z - 1)]);
+        int f6 = !opaque[XYZ(x, y, z + 1)] && !(wet && liquid[XYZ(x, y, z + 1)]);
         int total = f1 + f2 + f3 + f4 + f5 + f6;
         if (total == 0) {
             continue;
@@ -1087,12 +1177,14 @@ void compute_chunk(WorkerItem *item) {
         int x = ex - ox;
         int y = ey - oy;
         int z = ez - oz;
-        int f1 = !opaque[XYZ(x - 1, y, z)];
-        int f2 = !opaque[XYZ(x + 1, y, z)];
-        int f3 = !opaque[XYZ(x, y + 1, z)];
-        int f4 = !opaque[XYZ(x, y - 1, z)] && (ey > 0);
-        int f5 = !opaque[XYZ(x, y, z - 1)];
-        int f6 = !opaque[XYZ(x, y, z + 1)];
+        int wet = is_liquid(ew);
+        int f1 = !opaque[XYZ(x - 1, y, z)] && !(wet && liquid[XYZ(x - 1, y, z)]);
+        int f2 = !opaque[XYZ(x + 1, y, z)] && !(wet && liquid[XYZ(x + 1, y, z)]);
+        int f3 = !opaque[XYZ(x, y + 1, z)] && !(wet && liquid[XYZ(x, y + 1, z)]);
+        int f4 = !opaque[XYZ(x, y - 1, z)] && (ey > 0) &&
+            !(wet && liquid[XYZ(x, y - 1, z)]);
+        int f5 = !opaque[XYZ(x, y, z - 1)] && !(wet && liquid[XYZ(x, y, z - 1)]);
+        int f6 = !opaque[XYZ(x, y, z + 1)] && !(wet && liquid[XYZ(x, y, z + 1)]);
         int total = f1 + f2 + f3 + f4 + f5 + f6;
         if (total == 0) {
             continue;
@@ -1147,6 +1239,7 @@ void compute_chunk(WorkerItem *item) {
     } END_MAP_FOR_EACH;
 
     free(opaque);
+    free(liquid);
     free(light);
     free(highest);
 
@@ -1617,6 +1710,19 @@ void record_block(int x, int y, int z, int w) {
     g->block0.w = w;
 }
 
+// The OpenGL half of src/addon.c: a generated tile goes straight into the
+// atlas that is already on the graphics card.
+void addon_upload_tile(int tile, const unsigned char *pixels) {
+    glActiveTexture(GL_TEXTURE0);
+    // the atlas was flipped when it was loaded, so tile row 0 is row 0 here
+    glTexSubImage2D(GL_TEXTURE_2D, 0,
+        (tile % 16) * 16, (tile / 16) * 16, 16, 16,
+        GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+}
+
+// What entity.c asks the world.
+int entity_block_at(int x, int y, int z);
+
 int get_block(int x, int y, int z) {
     int p = chunked(x);
     int q = chunked(z);
@@ -1626,6 +1732,13 @@ int get_block(int x, int y, int z) {
         return map_get(map, x, y, z);
     }
     return 0;
+}
+
+int entity_block_at(int x, int y, int z) {
+    if (y < 0 || y >= 256) {
+        return y < 0 ? STONE : EMPTY;
+    }
+    return get_block(x, y, z);
 }
 
 void builder_block(int x, int y, int z, int w) {
@@ -1646,7 +1759,7 @@ int render_chunks(Attrib *attrib, Player *player) {
     ensure_chunks(player);
     int p = chunked(s->x);
     int q = chunked(s->z);
-    float light = get_daylight();
+    float light = g->dimension ? 0.55 : get_daylight();
     float matrix[16];
     set_matrix_3d(
         matrix, g->width, g->height,
@@ -1659,9 +1772,13 @@ int render_chunks(Attrib *attrib, Player *player) {
     glUniform1i(attrib->sampler, 0);
     glUniform1i(attrib->extra1, 2);
     glUniform1f(attrib->extra2, light);
-    glUniform1f(attrib->extra3, g->render_radius * CHUNK_SIZE);
+    glUniform1f(attrib->extra3, g->underwater
+        ? CHUNK_SIZE * 0.6 : g->render_radius * CHUNK_SIZE);
     glUniform1i(attrib->extra4, g->ortho);
     glUniform1f(attrib->timer, time_of_day());
+    glUniform1f(attrib->extra5, glfwGetTime());
+    glUniform1f(attrib->extra6, g->underwater ? 1.0 : 0.0);
+    glUniform1f(attrib->extra7, g->dimension ? 1.0 : 0.0);
     for (int i = 0; i < g->chunk_count; i++) {
         Chunk *chunk = g->chunks + i;
         if (chunk_distance(chunk, p, q) > g->render_radius) {
@@ -1752,6 +1869,49 @@ void render_players(Attrib *attrib, Player *player) {
     }
 }
 
+GLuint gen_mob_buffer(Entity *e, MobType *type, float light) {
+    GLfloat *data = malloc_faces(10, 12);
+    make_mob(data, e->x, e->y, e->z, e->rx, type->tile,
+        type->width, type->height, light);
+    return gen_faces(10, 12, data);
+}
+
+void render_entities(Attrib *attrib, Player *player) {
+    State *s = &player->state;
+    float matrix[16];
+    set_matrix_3d(
+        matrix, g->width, g->height,
+        s->x, s->y, s->z, s->rx, s->ry, g->fov, g->ortho, g->render_radius);
+    glUseProgram(attrib->program);
+    glUniformMatrix4fv(attrib->matrix, 1, GL_FALSE, matrix);
+    glUniform3f(attrib->camera, s->x, s->y, s->z);
+    glUniform1i(attrib->sampler, 0);
+    glUniform1f(attrib->timer, time_of_day());
+    for (int i = 0; i < MAX_ENTITIES; i++) {
+        Entity *e = entity_at(i);
+        if (!e->used) {
+            continue;
+        }
+        MobType *type = mob_type(e->kind);
+        // a creature that was just hit flashes bright for a moment
+        float light = e->hurt_flash > 0 ? 1.6 : 0.75;
+        GLuint buffer = gen_mob_buffer(e, type, light);
+        draw_triangles_3d_ao(attrib, buffer, 12 * 6);
+        del_buffer(buffer);
+    }
+    for (int i = 0; i < MAX_PROJECTILES; i++) {
+        Projectile *p = projectile_at(i);
+        if (!p->used) {
+            continue;
+        }
+        GLfloat *data = malloc_faces(10, 4);
+        make_sprite(data, 0, 1, p->x, p->y, p->z, 0.18, 102, 45);
+        GLuint buffer = gen_faces(10, 4, data);
+        draw_triangles_3d_ao(attrib, buffer, 4 * 6);
+        del_buffer(buffer);
+    }
+}
+
 void render_sky(Attrib *attrib, Player *player, GLuint buffer) {
     State *s = &player->state;
     float matrix[16];
@@ -1762,6 +1922,8 @@ void render_sky(Attrib *attrib, Player *player, GLuint buffer) {
     glUniformMatrix4fv(attrib->matrix, 1, GL_FALSE, matrix);
     glUniform1i(attrib->sampler, 2);
     glUniform1f(attrib->timer, time_of_day());
+    glUniform1f(attrib->extra1, g->underwater ? 1.0 : 0.0);
+    glUniform1f(attrib->extra2, g->dimension ? 1.0 : 0.0);
     draw_triangles_3d(attrib, buffer, 512 * 3);
 }
 
@@ -1814,15 +1976,25 @@ void render_item(Attrib *attrib) {
     glUniform3f(attrib->camera, 0, 0, 5);
     glUniform1i(attrib->sampler, 0);
     glUniform1f(attrib->timer, time_of_day());
-    int w = items[g->item_index];
-    if (is_plant(w)) {
+    ItemType *type = held_type();
+    if (!type) {
+        return;
+    }
+    int w = type->block;
+    if (w && is_plant(w)) {
         GLuint buffer = gen_plant_buffer(0, 0, 0, 0.5, w);
         draw_plant(attrib, buffer);
         del_buffer(buffer);
     }
-    else {
+    else if (w) {
         GLuint buffer = gen_cube_buffer(0, 0, 0, 0.5, w);
         draw_cube(attrib, buffer);
+        del_buffer(buffer);
+    }
+    else {
+        // a tool or a weapon: the flat sprite of its own icon
+        GLuint buffer = gen_sprite_buffer(0, 0, 0, 0.55, type->tile);
+        draw_plant(attrib, buffer);
         del_buffer(buffer);
     }
 }
@@ -2170,6 +2342,303 @@ void parse_command(const char *buffer, int forward) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// water
+// ---------------------------------------------------------------------------
+
+#define MAX_AIR 14
+
+int block_at_player(float dy) {
+    State *s = &g->players->state;
+    return get_block(roundf(s->x), roundf(s->y + dy), roundf(s->z));
+}
+
+// Water runs into the hole that was just dug. Not a full liquid simulation:
+// a breadth-first fill of at most 64 cells, fed by whatever water already
+// touches them. Enough to flood a tunnel into a lake, cheap enough for a
+// phone.
+void flood_water(int x, int y, int z) {
+    Block queue[64];
+    int head = 0;
+    int tail = 0;
+    queue[tail++] = (Block){x, y, z, 0};
+    while (head < tail) {
+        Block cell = queue[head++];
+        if (cell.y < 0 || cell.y > 255) {
+            continue;
+        }
+        if (get_block(cell.x, cell.y, cell.z) != EMPTY) {
+            continue;
+        }
+        int fed =
+            get_block(cell.x, cell.y + 1, cell.z) == WATER ||
+            get_block(cell.x - 1, cell.y, cell.z) == WATER ||
+            get_block(cell.x + 1, cell.y, cell.z) == WATER ||
+            get_block(cell.x, cell.y, cell.z - 1) == WATER ||
+            get_block(cell.x, cell.y, cell.z + 1) == WATER;
+        if (!fed) {
+            continue;
+        }
+        set_block(cell.x, cell.y, cell.z, WATER);
+        // downwards first, then sideways
+        int steps[5][3] = {
+            {0, -1, 0}, {-1, 0, 0}, {1, 0, 0}, {0, 0, -1}, {0, 0, 1}
+        };
+        for (int i = 0; i < 5 && tail < 64; i++) {
+            queue[tail++] = (Block){
+                cell.x + steps[i][0], cell.y + steps[i][1],
+                cell.z + steps[i][2], 0};
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// the two worlds
+// ---------------------------------------------------------------------------
+
+// Each dimension keeps its own world file. That way the chunk coordinates
+// stay small (a far-away second world would lose precision in a float) and
+// an old world file keeps working untouched.
+void travel_to_dimension(int dimension) {
+    State *s = &g->players->state;
+    if (dimension == g->dimension) {
+        return;
+    }
+    // take everything that belongs to the player with us
+    container_close();
+    db_save_state(s->x, s->y, s->z, s->rx, s->ry);
+    save_player_meta();
+    db_commit();
+    db_close();
+    db_disable();
+
+    g->dimension = dimension ? 1 : 0;
+    world_set_dimension(g->dimension);
+    delete_all_chunks();
+    entities_clear();
+
+    snprintf(g->db_path, MAX_PATH_LENGTH, "%s",
+        g->dimension ? UNDERWORLD_DB_PATH : DB_PATH);
+    db_enable();
+    if (db_init(g->db_path)) {
+        return;
+    }
+    save_player_meta();
+
+    float x, y, z, rx, ry;
+    if (db_load_state(&x, &y, &z, &rx, &ry)) {
+        s->x = x;
+        s->y = y;
+        s->z = z;
+        s->rx = rx;
+        s->ry = ry;
+    }
+    else if (g->dimension == 1) {
+        // arriving for the first time: keep x and z, drop in under the roof
+        s->y = UNDERWORLD_CEILING - 4;
+    }
+    g->dy = 0;
+    g->portal_timer = 1;
+    g->portal_ready = 0;           // step out of the gateway before it works
+    force_chunks(g->players);
+
+    // a way home, right where we land
+    int px = roundf(s->x);
+    int py = roundf(s->y) - 1;
+    int pz = roundf(s->z);
+    for (int dy = -1; dy <= 2; dy++) {
+        if (is_obstacle(get_block(px, py + dy, pz))) {
+            set_block(px, py + dy, pz, EMPTY);
+        }
+    }
+    set_block(px, py - 1, pz, PORTAL_STONE);
+    set_block(px, py, pz, PORTAL);
+    s->y = py + 1;
+    add_message(g->dimension
+        ? "The underworld (beta). The gateway behind you leads home."
+        : "Home again.");
+}
+
+// The fire starter opens a gateway on a portal stone. No frame to build:
+// stacking four blocks correctly is no fun with a thumb.
+int light_portal() {
+    State *s = &g->players->state;
+    ItemType *type = held_type();
+    if (!type || type->id != ITEM_FIRE_STARTER) {
+        return 0;
+    }
+    int hx, hy, hz;
+    int hw = hit_test(0, s->x, s->y, s->z, s->rx, s->ry, &hx, &hy, &hz);
+    if (hw != PORTAL_STONE) {
+        return 0;
+    }
+    if (get_block(hx, hy + 1, hz) != EMPTY) {
+        add_message("The gateway needs room above the stone.");
+        return 1;
+    }
+    set_block(hx, hy + 1, hz, PORTAL);
+    add_message("A gateway opens. Step into it.");
+    return 1;
+}
+
+// ---------------------------------------------------------------------------
+// survival
+// ---------------------------------------------------------------------------
+
+int held_item() {
+    Slot *slot = inv_slot(g->item_index);
+    return slot ? slot->item : 0;
+}
+
+ItemType *held_type() {
+    return item_type(held_item());
+}
+
+void hurt_player(float amount) {
+    if (g->game_mode != GAME_SURVIVAL || g->dead || amount <= 0) {
+        return;
+    }
+    g->health -= amount;
+    g->hurt_timer = 6;
+    g->regen_timer = 0;
+    if (g->health <= 0) {
+        g->health = 0;
+        g->dead = 1;
+    }
+}
+
+void heal_player(float amount) {
+    g->health += amount;
+    if (g->health > MAX_HEALTH) {
+        g->health = MAX_HEALTH;
+    }
+}
+
+void respawn_player() {
+    State *s = &g->players->state;
+    container_close();
+    entities_clear();
+    s->x = 0;
+    s->z = 0;
+    s->y = highest_block(s->x, s->z) + 2;
+    s->rx = 0;
+    s->ry = 0;
+    g->dy = 0;
+    g->health = MAX_HEALTH;
+    g->hurt_timer = 0;
+    g->regen_timer = 0;
+    g->air = MAX_AIR;
+    g->dead = 0;
+}
+
+void set_game_mode(int mode) {
+    g->game_mode = mode ? GAME_SURVIVAL : GAME_CREATIVE;
+    if (g->game_mode == GAME_SURVIVAL) {
+        g->flying = 0;
+        if (g->health <= 0) {
+            g->health = MAX_HEALTH;
+            g->dead = 0;
+        }
+    }
+    else {
+        g->health = MAX_HEALTH;
+        g->dead = 0;
+    }
+}
+
+// Health comes back on its own once nothing has hurt the player for a while.
+// No hunger bar: on a touch screen one more thing to watch is one too many.
+void survival_tick(double dt) {
+    int head = block_at_player(0);
+    g->underwater = is_liquid(head);
+
+    // A gateway carries the player over -- but only once per entry. Whoever
+    // arrives is standing in the gateway they came out of; without this they
+    // would bounce between the worlds for ever.
+    if (g->portal_timer > 0) {
+        g->portal_timer -= dt;
+    }
+    int in_portal = head == PORTAL || block_at_player(-1) == PORTAL;
+    if (!in_portal) {
+        g->portal_ready = 1;
+    }
+    else if (g->portal_ready && g->portal_timer <= 0) {
+        g->portal_ready = 0;
+        travel_to_dimension(g->dimension ? 0 : 1);
+        return;
+    }
+
+    if (g->game_mode != GAME_SURVIVAL) {
+        g->health = MAX_HEALTH;
+        g->air = MAX_AIR;
+        g->dead = 0;
+        return;
+    }
+    if (g->dead) {
+        return;
+    }
+
+    // breath, and what happens when it runs out
+    if (head == WATER) {
+        g->air -= dt;
+        if (g->air < 0) {
+            g->air = 0;
+            g->regen_timer += dt;
+            if (g->regen_timer >= 1) {
+                g->regen_timer = 0;
+                hurt_player(2);
+            }
+        }
+    }
+    else {
+        g->air += dt * 3;
+        if (g->air > MAX_AIR) {
+            g->air = MAX_AIR;
+        }
+    }
+    // lava is not a place to stand
+    if (head == LAVA || block_at_player(-1) == LAVA) {
+        g->hurt_timer = 6;
+        g->regen_timer += dt;
+        if (g->regen_timer >= 0.5) {
+            g->regen_timer = 0;
+            hurt_player(3);
+        }
+    }
+    if (g->hurt_timer > 0) {
+        g->hurt_timer -= dt;
+    }
+    else if (g->health < MAX_HEALTH) {
+        g->regen_timer += dt;
+        if (g->regen_timer >= 4) {
+            g->regen_timer = 0;
+            heal_player(1);
+        }
+    }
+}
+
+void save_player_meta() {
+    char buffer[32];
+    db_set_meta("inventory", inventory_save_string());
+    snprintf(buffer, sizeof(buffer), "%d", (int)g->health);
+    db_set_meta("health", buffer);
+    snprintf(buffer, sizeof(buffer), "%d", g->game_mode);
+    db_set_meta("mode", buffer);
+    snprintf(buffer, sizeof(buffer), "%d", g->dimension);
+    db_set_meta("dimension", buffer);
+}
+
+void use_held_item() {
+    ItemType *type = held_type();
+    if (!type) {
+        return;
+    }
+    if (type->kind == KIND_FOOD && g->health < MAX_HEALTH) {
+        heal_player(type->heal);
+        inv_remove_at(g->item_index, 1);
+    }
+}
+
 void on_light() {
     State *s = &g->players->state;
     int hx, hy, hz;
@@ -2179,40 +2648,193 @@ void on_light() {
     }
 }
 
+// Swinging, shooting, or mining -- decided by what is in the hand and what
+// is in the crosshair.
+void attack_or_shoot() {
+    State *s = &g->players->state;
+    ItemType *type = held_type();
+    float vx, vy, vz;
+    get_sight_vector(s->rx, s->ry, &vx, &vy, &vz);
+
+    if (type && type->kind == KIND_RANGED) {
+        if (g->attack_timer > 0) {
+            return;
+        }
+        if (g->game_mode == GAME_SURVIVAL && !inv_take(ITEM_ARROW, 1)) {
+            add_message("Out of bolts.");
+            return;
+        }
+        g->attack_timer = type->cooldown;
+        projectile_spawn(s->x, s->y - 0.2, s->z,
+            vx * 26, vy * 26, vz * 26, type->damage);
+        return;
+    }
+
+    int index = entity_pick(s->x, s->y, s->z, vx, vy, vz, 4.5);
+    if (index < 0) {
+        index = entity_pick_near(s->x, s->y, s->z, vx, vz, 2.5);
+    }
+    if (index >= 0) {
+        if (g->attack_timer > 0) {
+            return;
+        }
+        float damage = type && type->damage > 1 ? type->damage : 1;
+        g->attack_timer = type ? type->cooldown : 0.35;
+        int count = 0;
+        int drop = entity_damage(index, damage, &count);
+        if (drop && g->game_mode == GAME_SURVIVAL) {
+            inv_add(drop, count);
+        }
+        return;
+    }
+    on_left_click();
+}
+
+// How long the player has to wait after breaking a block. Stone takes its
+// time, dirt does not, and the right tool roughly halves it. Creative mode
+// has no wait at all -- there, building is the whole point.
+float block_break_time(int w, int item) {
+    float base;
+    switch (ABS(w)) {
+        case TALL_GRASS: case YELLOW_FLOWER: case RED_FLOWER:
+        case PURPLE_FLOWER: case SUN_FLOWER: case WHITE_FLOWER:
+        case BLUE_FLOWER: case LEAVES:
+            base = 0.15;
+            break;
+        case DIRT: case GRASS: case SAND: case SNOW: case ASH_SAND:
+            base = 0.35;
+            break;
+        case WOOD: case PLANK: case CHEST:
+            base = 0.55;
+            break;
+        case GLASS:
+            base = 0.30;
+            break;
+        case COAL_ORE: case IRON_ORE: case GEM_ORE: case GLOW_ROCK:
+            base = 1.40;
+            break;
+        case STONE: case COBBLE: case BRICK: case CEMENT: case DARK_STONE:
+        case LIGHT_STONE: case EMBER_ROCK: case EMBER_BRICK: case PORTAL_STONE:
+            base = 1.00;
+            break;
+        default:
+            base = 0.60;
+            break;
+    }
+    // the right tool for the job
+    int stony = base >= 1.0;
+    int woody = ABS(w) == WOOD || ABS(w) == PLANK || ABS(w) == CHEST ||
+                ABS(w) == LEAVES;
+    int diggy = ABS(w) == DIRT || ABS(w) == GRASS || ABS(w) == SAND ||
+                ABS(w) == SNOW || ABS(w) == ASH_SAND;
+    if ((item == ITEM_PICKAXE && stony) ||
+        (item == ITEM_AXE && woody) ||
+        (item == ITEM_SHOVEL && diggy))
+    {
+        base *= 0.45;
+    }
+    return base;
+}
+
 void on_left_click() {
     State *s = &g->players->state;
+    if (g->dead) {
+        return;
+    }
+    if (g->game_mode == GAME_SURVIVAL && g->mine_timer > 0) {
+        return;               // still catching breath from the last block
+    }
     int hx, hy, hz;
     int hw = hit_test(0, s->x, s->y, s->z, s->rx, s->ry, &hx, &hy, &hz);
     if (hy > 0 && hy < 256 && is_destructable(hw)) {
+        if (g->game_mode == GAME_SURVIVAL) {
+            g->mine_total = block_break_time(hw, held_item());
+            g->mine_timer = g->mine_total;
+        }
         set_block(hx, hy, hz, 0);
         record_block(hx, hy, hz, 0);
         if (is_plant(get_block(hx, hy + 1, hz))) {
             set_block(hx, hy + 1, hz, 0);
+        }
+        flood_water(hx, hy, hz);
+        if (hw == CHEST) {
+            container_break(hx, hy, hz);
+            add_message("The chest spills its contents into your bag.");
+        }
+        // In survival the block goes into the bag; in creative it is gone,
+        // because there the bag is bottomless anyway.
+        if (g->game_mode == GAME_SURVIVAL) {
+            int drop = block_drop(hw);
+            if (drop) {
+                inv_add(drop, 1);
+            }
         }
     }
 }
 
 void on_right_click() {
     State *s = &g->players->state;
+    if (g->dead) {
+        return;
+    }
+    // A chest is a thing you open, not a thing you build against.
+    {
+        int cx, cy, cz;
+        int cw = hit_test(0, s->x, s->y, s->z, s->rx, s->ry, &cx, &cy, &cz);
+        if (cw == CHEST) {
+            container_open(cx, cy, cz);
+            return;
+        }
+    }
+    ItemType *type = held_type();
+    if (!type) {
+        return;
+    }
+    if (!type->block) {
+        // nothing to place: light a gateway, eat it, or swing it (weapons
+        // are handled by the attack button)
+        if (light_portal()) {
+            return;
+        }
+        use_held_item();
+        return;
+    }
     int hx, hy, hz;
     int hw = hit_test(1, s->x, s->y, s->z, s->rx, s->ry, &hx, &hy, &hz);
     if (hy > 0 && hy < 256 && is_obstacle(hw)) {
         if (!player_intersects_block(2, s->x, s->y, s->z, hx, hy, hz)) {
-            set_block(hx, hy, hz, items[g->item_index]);
-            record_block(hx, hy, hz, items[g->item_index]);
+            set_block(hx, hy, hz, type->block);
+            record_block(hx, hy, hz, type->block);
+            if (g->game_mode == GAME_SURVIVAL) {
+                inv_remove_at(g->item_index, 1);
+            }
         }
     }
 }
 
+// Pick the block that is in the crosshair. In creative it appears in the
+// hand, in survival it only selects a slot that already holds it.
 void on_middle_click() {
     State *s = &g->players->state;
     int hx, hy, hz;
     int hw = hit_test(0, s->x, s->y, s->z, s->rx, s->ry, &hx, &hy, &hz);
-    for (int i = 0; i < item_count; i++) {
-        if (items[i] == hw) {
-            g->item_index = i;
-            break;
+    if (!hw) {
+        return;
+    }
+    for (int i = 0; i < INVENTORY_SIZE; i++) {
+        Slot *slot = inv_slot(i);
+        if (slot->item == hw && slot->count) {
+            if (i < HOTBAR_SIZE) {
+                g->item_index = i;
+            }
+            else {
+                inv_move(i, g->item_index);
+            }
+            return;
         }
+    }
+    if (g->game_mode == GAME_CREATIVE && item_type(hw)) {
+        inv_set_slot(g->item_index, hw, 1);
     }
 }
 
@@ -2289,22 +2911,19 @@ void on_key(GLFWwindow *window, int key, int scancode, int action, int mods) {
         }
     }
     if (!g->typing) {
-        if (key == CRAFT_KEY_FLY) {
+        if (key == CRAFT_KEY_FLY && g->game_mode == GAME_CREATIVE) {
             g->flying = !g->flying;
         }
         if (key >= '1' && key <= '9') {
             g->item_index = key - '1';
         }
-        if (key == '0') {
-            g->item_index = 9;
-        }
         if (key == CRAFT_KEY_ITEM_NEXT) {
-            g->item_index = (g->item_index + 1) % item_count;
+            g->item_index = (g->item_index + 1) % HOTBAR_SIZE;
         }
         if (key == CRAFT_KEY_ITEM_PREV) {
             g->item_index--;
             if (g->item_index < 0) {
-                g->item_index = item_count - 1;
+                g->item_index = HOTBAR_SIZE - 1;
             }
         }
         if (key == CRAFT_KEY_OBSERVE) {
@@ -2353,13 +2972,13 @@ void on_scroll(GLFWwindow *window, double xdelta, double ydelta) {
     static double ypos = 0;
     ypos += ydelta;
     if (ypos < -SCROLL_THRESHOLD) {
-        g->item_index = (g->item_index + 1) % item_count;
+        g->item_index = (g->item_index + 1) % HOTBAR_SIZE;
         ypos = 0;
     }
     if (ypos > SCROLL_THRESHOLD) {
         g->item_index--;
         if (g->item_index < 0) {
-            g->item_index = item_count - 1;
+            g->item_index = HOTBAR_SIZE - 1;
         }
         ypos = 0;
     }
@@ -2417,6 +3036,8 @@ void on_mouse_button(GLFWwindow *window, int button, int action, int mods) {
 // where the desktop build reads mouse and keyboard.
 // ---------------------------------------------------------------------------
 
+static int web_save_requested = 0;
+
 typedef struct {
     float move_x;      // strafe, -1 (left) .. 1 (right)
     float move_z;      // walk, -1 (forward) .. 1 (backward)
@@ -2444,6 +3065,9 @@ EMSCRIPTEN_KEEPALIVE void craft_touch_jump(int down) {
 }
 
 EMSCRIPTEN_KEEPALIVE void craft_toggle_fly() {
+    if (g->game_mode == GAME_SURVIVAL) {
+        return;
+    }
     g->flying = !g->flying;
 }
 
@@ -2452,7 +3076,7 @@ EMSCRIPTEN_KEEPALIVE int craft_is_flying() {
 }
 
 EMSCRIPTEN_KEEPALIVE void craft_break_block() {
-    on_left_click();
+    attack_or_shoot();
 }
 
 EMSCRIPTEN_KEEPALIVE void craft_place_block() {
@@ -2464,14 +3088,291 @@ EMSCRIPTEN_KEEPALIVE void craft_pick_block() {
 }
 
 EMSCRIPTEN_KEEPALIVE void craft_cycle_item(int direction) {
-    g->item_index = (g->item_index + direction) % item_count;
+    g->item_index = (g->item_index + direction) % HOTBAR_SIZE;
     if (g->item_index < 0) {
-        g->item_index += item_count;
+        g->item_index += HOTBAR_SIZE;
     }
 }
 
 EMSCRIPTEN_KEEPALIVE void craft_resize(int width, int height) {
     emscripten_set_canvas_element_size("#canvas", width, height);
+}
+
+// --- survival, inventory and crafting, read by web/ui.js -------------------
+
+EMSCRIPTEN_KEEPALIVE int craft_game_mode() {
+    return g->game_mode;
+}
+
+EMSCRIPTEN_KEEPALIVE void craft_set_game_mode(int mode) {
+    set_game_mode(mode);
+}
+
+EMSCRIPTEN_KEEPALIVE int craft_health() {
+    return (int)ceilf(g->health);
+}
+
+EMSCRIPTEN_KEEPALIVE int craft_max_health() {
+    return MAX_HEALTH;
+}
+
+// 0 .. 100, how much breath is left; 100 also means "not under water"
+// 0 while the player may break a block, else how much of the wait is left,
+// from 100 down to 0.
+EMSCRIPTEN_KEEPALIVE int craft_mine_cooldown() {
+    if (g->mine_timer <= 0 || g->mine_total <= 0) {
+        return 0;
+    }
+    return (int)(100 * g->mine_timer / g->mine_total);
+}
+
+EMSCRIPTEN_KEEPALIVE int craft_air() {
+    return (int)(100 * g->air / MAX_AIR);
+}
+
+EMSCRIPTEN_KEEPALIVE int craft_is_dead() {
+    return g->dead;
+}
+
+EMSCRIPTEN_KEEPALIVE void craft_respawn() {
+    respawn_player();
+}
+
+EMSCRIPTEN_KEEPALIVE int craft_inv_version() {
+    return inv_version();
+}
+
+EMSCRIPTEN_KEEPALIVE int craft_inv_item(int index) {
+    Slot *slot = inv_slot(index);
+    return slot ? slot->item : 0;
+}
+
+EMSCRIPTEN_KEEPALIVE int craft_inv_count(int index) {
+    Slot *slot = inv_slot(index);
+    return slot ? slot->count : 0;
+}
+
+EMSCRIPTEN_KEEPALIVE int craft_hotbar_index() {
+    return g->item_index;
+}
+
+EMSCRIPTEN_KEEPALIVE void craft_select_slot(int index) {
+    if (index >= 0 && index < HOTBAR_SIZE) {
+        g->item_index = index;
+    }
+}
+
+EMSCRIPTEN_KEEPALIVE void craft_inv_move(int from, int to) {
+    inv_move(from, to);
+}
+
+EMSCRIPTEN_KEEPALIVE void craft_inv_drop(int index) {
+    inv_remove_at(index, 64);
+}
+
+// The creative palette hands out blocks; survival has to find them.
+EMSCRIPTEN_KEEPALIVE void craft_inv_give(int item, int count) {
+    if (g->game_mode == GAME_CREATIVE) {
+        inv_set_slot(g->item_index, item, count);
+    }
+}
+
+EMSCRIPTEN_KEEPALIVE const char *craft_items_json() {
+    return items_json();
+}
+
+EMSCRIPTEN_KEEPALIVE const char *craft_recipes_json() {
+    return recipes_json();
+}
+
+EMSCRIPTEN_KEEPALIVE int craft_can_craft(int index) {
+    return recipe_can_craft(index);
+}
+
+EMSCRIPTEN_KEEPALIVE int craft_do_craft(int index) {
+    return recipe_craft(index);
+}
+
+EMSCRIPTEN_KEEPALIVE void craft_use_item() {
+    use_held_item();
+}
+
+// A menu is open: creatures wait instead of eating the player behind it.
+EMSCRIPTEN_KEEPALIVE void craft_set_paused(int paused) {
+    g->paused = paused ? 1 : 0;
+}
+
+// A handful of numbers for tools/smoke-test.js -- a test that can only see
+// pixels cannot tell "the creature is stuck" from "the creature is missing".
+//
+//   0..2  player x/y/z        7  creature ticks since the start
+//   3..5  nearest creature    8  its vertical speed
+//   6     its kind            9  the player's vertical speed
+//   12    its health         10  hurt timer, 11 health as a float
+EMSCRIPTEN_KEEPALIVE float craft_probe(int what) {
+    State *s = &g->players->state;
+    if (what == 0) return s->x;
+    if (what == 1) return s->y;
+    if (what == 2) return s->z;
+    if (what == 7) return entities_tick_count();
+    if (what == 9) return g->dy;
+    if (what == 10) return g->hurt_timer;
+    if (what == 11) return g->health;
+    Entity *best = 0;
+    float best_distance = 0;
+    for (int i = 0; i < MAX_ENTITIES; i++) {
+        Entity *e = entity_at(i);
+        if (!e->used) {
+            continue;
+        }
+        float dx = e->x - s->x;
+        float dz = e->z - s->z;
+        float distance = sqrtf(dx * dx + dz * dz);
+        if (!best || distance < best_distance) {
+            best = e;
+            best_distance = distance;
+        }
+    }
+    if (!best) return -999;
+    if (what == 3) return best->x;
+    if (what == 4) return best->y;
+    if (what == 5) return best->z;
+    if (what == 6) return best->kind;
+    if (what == 12) return best->health;
+    if (what == 8) return best->dy;
+    return 0;
+}
+
+// Two more for tools and tests: what is in a given block, and putting the
+// player somewhere. Both are plain reads and writes of state the player can
+// reach anyway.
+EMSCRIPTEN_KEEPALIVE int craft_block_at(int x, int y, int z) {
+    return get_block(x, y, z);
+}
+
+EMSCRIPTEN_KEEPALIVE void craft_teleport(float x, float y, float z) {
+    State *s = &g->players->state;
+    s->x = x;
+    s->y = y;
+    s->z = z;
+    g->dy = 0;
+}
+
+// --- add-ons (see web/ADDONS.md) ------------------------------------------
+//
+// The browser parses the JSON and calls these. An add-on is data: there is
+// no call here that runs anything it supplies.
+
+EMSCRIPTEN_KEEPALIVE int craft_addon_block(
+    const char *name, int red, int green, int blue, int speckle, int glassy)
+{
+    return addon_add_block(name, red, green, blue, speckle, glassy);
+}
+
+EMSCRIPTEN_KEEPALIVE int craft_addon_item(
+    const char *name, int kind, int red, int green, int blue,
+    int damage, int heal)
+{
+    return addon_add_item(name, kind, red, green, blue, damage, heal);
+}
+
+EMSCRIPTEN_KEEPALIVE int craft_addon_recipe(
+    int result, int count, int item0, int count0, int item1, int count1)
+{
+    return addon_add_recipe(result, count, item0, count0, item1, count1);
+}
+
+EMSCRIPTEN_KEEPALIVE int craft_addon_creature(
+    const char *name, int red, int green, int blue, int health, int speed,
+    int damage, int hostile, int drop, int drop_count)
+{
+    return addon_add_creature(name, red, green, blue, health, speed, damage,
+        hostile, drop, drop_count);
+}
+
+// Everything an add-on added disappears again; the interface reloads the
+// page afterwards, so the tables are rebuilt from scratch.
+EMSCRIPTEN_KEEPALIVE void craft_addon_reset() {
+    addon_reset();
+}
+
+EMSCRIPTEN_KEEPALIVE int craft_addon_count() {
+    return addon_block_count() + addon_item_count();
+}
+
+// --- chests ---------------------------------------------------------------
+
+EMSCRIPTEN_KEEPALIVE int craft_container_open() {
+    return container_is_open();
+}
+
+EMSCRIPTEN_KEEPALIVE int craft_container_size() {
+    return CHEST_SLOTS;
+}
+
+EMSCRIPTEN_KEEPALIVE int craft_container_item(int index) {
+    Slot *slot = container_slot(index);
+    return slot ? slot->item : 0;
+}
+
+EMSCRIPTEN_KEEPALIVE int craft_container_count(int index) {
+    Slot *slot = container_slot(index);
+    return slot ? slot->count : 0;
+}
+
+EMSCRIPTEN_KEEPALIVE int craft_container_take(int index) {
+    return container_take(index);
+}
+
+EMSCRIPTEN_KEEPALIVE int craft_container_put(int index) {
+    return container_put(index);
+}
+
+EMSCRIPTEN_KEEPALIVE void craft_container_close() {
+    container_close();
+}
+
+EMSCRIPTEN_KEEPALIVE int craft_dimension() {
+    return g->dimension;
+}
+
+EMSCRIPTEN_KEEPALIVE int craft_is_paused() {
+    return g->paused;
+}
+
+EMSCRIPTEN_KEEPALIVE int craft_entity_count() {
+    return entity_count();
+}
+
+// Sends every creature away. The menu uses it for a fresh start, the smoke
+// test to measure against a known state.
+EMSCRIPTEN_KEEPALIVE void craft_clear_mobs() {
+    entities_clear();
+}
+
+// Hands a creature into the world in front of the player. Used by the smoke
+// test, and by anyone who wants to see what they are building.
+EMSCRIPTEN_KEEPALIVE void craft_spawn_mob(int kind) {
+    State *s = &g->players->state;
+    entity_spawn_in_front(kind, s->x, s->y - 1, s->z, s->rx);
+}
+
+EMSCRIPTEN_KEEPALIVE float craft_nearest_mob() {
+    State *s = &g->players->state;
+    float best = -1;
+    for (int i = 0; i < MAX_ENTITIES; i++) {
+        Entity *e = entity_at(i);
+        if (!e->used) {
+            continue;
+        }
+        float dx = e->x - s->x;
+        float dz = e->z - s->z;
+        float distance = sqrtf(dx * dx + dz * dz);
+        if (best < 0 || distance < best) {
+            best = distance;
+        }
+    }
+    return best;
 }
 
 // Hand the finished frame to the browser and continue on the next animation
@@ -2495,6 +3396,17 @@ EM_JS(void, web_save_world, (), {
         }
     });
 });
+
+// Saving is only *asked for* here, never done here.
+//
+// The main loop sleeps inside asyncify between two frames. An export called
+// from a JavaScript handler that starts asynchronous work -- FS.syncfs does,
+// through IndexedDB -- overwrites the stack asyncify saved for the loop, and
+// the next frame dies with "memory access out of bounds". So the flag is set
+// here and the loop does the work on its own turn.
+EMSCRIPTEN_KEEPALIVE void craft_save_now() {
+    web_save_requested = 1;
+}
 
 #endif
 
@@ -2582,10 +3494,13 @@ void handle_mouse_input() {
 }
 
 void handle_movement(double dt) {
-    static float dy = 0;
     State *s = &g->players->state;
     int sz = 0;
     int sx = 0;
+    if (g->dead) {
+        // no walking away from being dead -- the screen asks to respawn
+        return;
+    }
     if (!g->typing) {
         float m = dt * 1.0;
         g->ortho = glfwGetKey(g->window, CRAFT_KEY_ORTHO) ? 64 : 0;
@@ -2616,12 +3531,19 @@ void handle_movement(double dt) {
             if (g->flying) {
                 vy = 1;
             }
-            else if (dy == 0) {
-                dy = 8;
+            else if (is_liquid(block_at_player(0)) ||
+                     is_liquid(block_at_player(-1)))
+            {
+                g->dy = 4;     // paddle upwards
+            }
+            else if (g->dy == 0) {
+                g->dy = 8;
             }
         }
     }
-    float speed = g->flying ? 20 : 5;
+    // swimming: slower, gentler gravity, and the jump button paddles up
+    int in_liquid = is_liquid(block_at_player(0)) || is_liquid(block_at_player(-1));
+    float speed = g->flying ? 20 : (in_liquid ? 3 : 5);
 #ifdef __EMSCRIPTEN__
     // A stick pushed halfway walks at half speed.
     if ((sx || sz) && touch.move_scale > 0) {
@@ -2630,7 +3552,7 @@ void handle_movement(double dt) {
 #endif
     int estimate = roundf(sqrtf(
         powf(vx * speed, 2) +
-        powf(vy * speed + ABS(dy) * 2, 2) +
+        powf(vy * speed + ABS(g->dy) * 2, 2) +
         powf(vz * speed, 2)) * dt * 8);
     int step = MAX(8, estimate);
     float ut = dt / step;
@@ -2639,17 +3561,29 @@ void handle_movement(double dt) {
     vz = vz * ut * speed;
     for (int i = 0; i < step; i++) {
         if (g->flying) {
-            dy = 0;
+            g->dy = 0;
+        }
+        else if (in_liquid) {
+            g->dy -= ut * 8;
+            g->dy = MAX(g->dy, -3);    // sinking, not falling
         }
         else {
-            dy -= ut * 25;
-            dy = MAX(dy, -250);
+            g->dy -= ut * 25;
+            g->dy = MAX(g->dy, -250);
         }
         s->x += vx;
-        s->y += vy + dy * ut;
+        s->y += vy + g->dy * ut;
         s->z += vz;
         if (collide(2, &s->x, &s->y, &s->z)) {
-            dy = 0;
+            // Landing: the speed says how far the fall was. Four blocks are
+            // free, everything above that hurts.
+            if (g->dy < 0 && !in_liquid) {
+                float distance = (g->dy * g->dy) / 50.0;
+                if (distance > 4) {
+                    hurt_player(distance - 4);
+                }
+            }
+            g->dy = 0;
         }
     }
     if (s->y < 0) {
@@ -2763,6 +3697,20 @@ void reset_model() {
     g->observe2 = 0;
     g->flying = 0;
     g->item_index = 0;
+    g->dy = 0;
+    g->dead = 0;
+    g->air = MAX_AIR;
+    g->underwater = 0;
+    g->portal_timer = 0;
+    g->portal_ready = 1;
+    g->paused = 0;
+    g->attack_timer = 0;
+    g->mine_timer = 0;
+    g->mine_total = 0;
+    g->dimension = 0;
+    g->hurt_timer = 0;
+    g->regen_timer = 0;
+    g->health = MAX_HEALTH;
     memset(g->typing_buffer, 0, sizeof(char) * MAX_TEXT_LENGTH);
     g->typing = 0;
     memset(g->messages, 0, sizeof(char) * MAX_MESSAGES * MAX_TEXT_LENGTH);
@@ -2823,6 +3771,7 @@ int main(int argc, char **argv) {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     load_png_texture("textures/texture.png");
+    addon_set_atlas(texture);
 
     GLuint font;
     glGenTextures(1, &font);
@@ -2871,6 +3820,9 @@ int main(int argc, char **argv) {
     block_attrib.extra4 = glGetUniformLocation(program, "ortho");
     block_attrib.camera = glGetUniformLocation(program, "camera");
     block_attrib.timer = glGetUniformLocation(program, "timer");
+    block_attrib.extra5 = glGetUniformLocation(program, "wave");
+    block_attrib.extra6 = glGetUniformLocation(program, "underwater");
+    block_attrib.extra7 = glGetUniformLocation(program, "underworld");
 
     program = load_program(
         "shaders/line_vertex.glsl", "shaders/line_fragment.glsl");
@@ -2896,6 +3848,8 @@ int main(int argc, char **argv) {
     sky_attrib.matrix = glGetUniformLocation(program, "matrix");
     sky_attrib.sampler = glGetUniformLocation(program, "sampler");
     sky_attrib.timer = glGetUniformLocation(program, "timer");
+    sky_attrib.extra1 = glGetUniformLocation(program, "underwater");
+    sky_attrib.extra2 = glGetUniformLocation(program, "underworld");
 
     // CHECK COMMAND LINE ARGUMENTS //
     if (argc == 2 || argc == 3) {
@@ -2909,6 +3863,19 @@ int main(int argc, char **argv) {
         g->mode = MODE_OFFLINE;
         snprintf(g->db_path, MAX_PATH_LENGTH, "%s", DB_PATH);
     }
+
+    inventory_init();
+    entities_init();
+#ifdef __EMSCRIPTEN__
+    // onRuntimeInitialized fires before main() runs: at that moment the item
+    // registry is still empty, and an interface that reads it then gets
+    // nothing. So the game says when it is actually ready.
+    EM_ASM({
+        if (window.CraftUI && CraftUI.gameReady) {
+            CraftUI.gameReady();
+        }
+    });
+#endif
 
     g->create_radius = CREATE_CHUNK_RADIUS;
     g->render_radius = RENDER_CHUNK_RADIUS;
@@ -2981,6 +3948,28 @@ int main(int argc, char **argv) {
             s->y = highest_block(s->x, s->z) + 2;
         }
 
+        // INVENTORY, HEALTH AND GAME MODE //
+        char meta[2048];
+        if (db_get_meta("mode", meta, sizeof(meta))) {
+            set_game_mode(atoi(meta));
+        }
+        if (db_get_meta("inventory", meta, sizeof(meta))) {
+            inventory_load_string(meta);
+        }
+        else {
+            inv_give_starting_items(g->game_mode);
+        }
+        if (db_get_meta("dimension", meta, sizeof(meta)) && atoi(meta) == 1) {
+            // the player logged out down there
+            travel_to_dimension(1);
+        }
+        if (db_get_meta("health", meta, sizeof(meta))) {
+            g->health = atof(meta);
+            if (g->health <= 0) {
+                g->health = MAX_HEALTH;
+            }
+        }
+
         // BEGIN MAIN LOOP //
         double previous = glfwGetTime();
         while (1) {
@@ -3009,6 +3998,43 @@ int main(int argc, char **argv) {
             // HANDLE MOVEMENT //
             handle_movement(dt);
 
+            // SURVIVAL //
+            survival_tick(dt);
+            if (g->attack_timer > 0) {
+                g->attack_timer -= dt;
+            }
+            if (g->mine_timer > 0) {
+                g->mine_timer -= dt;
+            }
+
+            // CREATURES //
+            {
+                float daylight = get_daylight();
+                float damage = entities_update(
+                    dt, s->x, s->y, s->z, g->dimension, daylight, g->paused);
+                if (damage > 0) {
+                    hurt_player(damage);
+                }
+                if (!g->paused) {
+                    entities_maybe_spawn(
+                        dt, s->x, s->y, s->z, g->dimension, daylight);
+                }
+                // bolts that found a creature
+                for (int i = 0; i < MAX_PROJECTILES; i++) {
+                    Projectile *p = projectile_at(i);
+                    if (!p->hit) {
+                        continue;
+                    }
+                    int count = 0;
+                    int drop = entity_damage(p->hit - 1, p->damage, &count);
+                    if (drop && g->game_mode == GAME_SURVIVAL) {
+                        inv_add(drop, count);
+                    }
+                    p->used = 0;
+                    p->hit = 0;
+                }
+            }
+
             // HANDLE DATA FROM SERVER //
             char *buffer = client_recv();
             if (buffer) {
@@ -3017,8 +4043,19 @@ int main(int argc, char **argv) {
             }
 
             // FLUSH DATABASE //
+#ifdef __EMSCRIPTEN__
+            // the menu asked for a save on its own turn, see craft_save_now()
+            if (web_save_requested) {
+                web_save_requested = 0;
+                last_commit = now;
+                save_player_meta();
+                db_commit();
+                web_save_world();
+            }
+#endif
             if (now - last_commit > COMMIT_INTERVAL) {
                 last_commit = now;
+                save_player_meta();
 #ifdef __EMSCRIPTEN__
                 // A browser tab is never shut down properly, so the position
                 // has to be written with every commit -- not only in the
@@ -3057,6 +4094,7 @@ int main(int argc, char **argv) {
             render_signs(&text_attrib, player);
             render_sign(&text_attrib, player);
             render_players(&block_attrib, player);
+            render_entities(&block_attrib, player);
             if (SHOW_WIREFRAME) {
                 render_wireframe(&line_attrib, player);
             }
@@ -3145,6 +4183,7 @@ int main(int argc, char **argv) {
                 render_chunks(&block_attrib, player);
                 render_signs(&text_attrib, player);
                 render_players(&block_attrib, player);
+            render_entities(&block_attrib, player);
                 glClear(GL_DEPTH_BUFFER_BIT);
                 if (SHOW_PLAYER_NAMES) {
                     render_text(&text_attrib, ALIGN_CENTER,
@@ -3170,6 +4209,7 @@ int main(int argc, char **argv) {
 
         // SHUTDOWN //
         db_save_state(s->x, s->y, s->z, s->rx, s->ry);
+        save_player_meta();
         db_close();
 #ifdef __EMSCRIPTEN__
         web_save_world();

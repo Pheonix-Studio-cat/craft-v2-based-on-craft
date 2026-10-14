@@ -1,8 +1,74 @@
 #include "config.h"
+#include "item.h"
 #include "noise.h"
 #include "world.h"
 
+static int dimension = 0;
+
+void world_set_dimension(int value) {
+    dimension = value ? 1 : 0;
+}
+
+int world_dimension() {
+    return dimension;
+}
+
+// The underworld: rock with caves eaten out of it, a sea of lava at the
+// bottom, a rock ceiling on top and glowing stone where the caves break the
+// surface. Deliberately claustrophobic -- it is the other half of a world
+// whose first half is open sky.
+static void create_underworld(int p, int q, world_func func, void *arg) {
+    int pad = 1;
+    for (int dx = -pad; dx < CHUNK_SIZE + pad; dx++) {
+        for (int dz = -pad; dz < CHUNK_SIZE + pad; dz++) {
+            int flag = 1;
+            if (dx < 0 || dz < 0 || dx >= CHUNK_SIZE || dz >= CHUNK_SIZE) {
+                flag = -1;
+            }
+            int x = p * CHUNK_SIZE + dx;
+            int z = q * CHUNK_SIZE + dz;
+            int last_solid = 0;
+            for (int y = 0; y < UNDERWORLD_CEILING + 4; y++) {
+                int solid;
+                if (y < 3 || y >= UNDERWORLD_CEILING) {
+                    solid = 1;              // floor and ceiling close it off
+                }
+                else {
+                    float cave = simplex3(
+                        x * 0.021, y * 0.045, z * 0.021, 4, 0.5, 2);
+                    // Craft's noise runs from 0 to 1 with its mass around
+                    // 0.5 -- a threshold below that would leave no caves at
+                    // all. Open down at the lava, dense under the ceiling.
+                    float bias = 0.60 - 0.20 * (float)y / UNDERWORLD_CEILING;
+                    solid = cave > bias;
+                }
+                int w = EMBER_ROCK;
+                if (solid) {
+                    // ash sand in patches, glowing stone at the cave roofs
+                    if (simplex2(x * 0.04, z * 0.04, 3, 0.6, 2) > 0.66) {
+                        w = ASH_SAND;
+                    }
+                    else if (!last_solid && y > 6 &&
+                        simplex3(x * 0.07, y * 0.07, z * 0.07, 2, 0.5, 2) > 0.66)
+                    {
+                        w = GLOW_ROCK;
+                    }
+                    func(x, y, z, w * flag, arg);
+                }
+                else if (y <= LAVA_LEVEL) {
+                    func(x, y, z, LAVA * flag, arg);
+                }
+                last_solid = solid;
+            }
+        }
+    }
+}
+
 void create_world(int p, int q, world_func func, void *arg) {
+    if (dimension == 1) {
+        create_underworld(p, q, func, arg);
+        return;
+    }
     int pad = 1;
     for (int dx = -pad; dx < CHUNK_SIZE + pad; dx++) {
         for (int dz = -pad; dz < CHUNK_SIZE + pad; dz++) {
@@ -26,7 +92,11 @@ void create_world(int p, int q, world_func func, void *arg) {
             for (int y = 0; y < h; y++) {
                 func(x, y, z, w * flag, arg);
             }
-            if (w == 1) {
+            // water fills everything the land does not reach up to
+            for (int y = h; y < SEA_LEVEL; y++) {
+                func(x, y, z, WATER * flag, arg);
+            }
+            if (w == 1 && h >= SEA_LEVEL) {
                 if (SHOW_PLANTS) {
                     // grass
                     if (simplex2(-x * 0.1, z * 0.1, 4, 0.8, 2) > 0.6) {
